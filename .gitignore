@@ -16,6 +16,14 @@ data/
 figures/
 probability_function/
 
+# Directories not part of the main package
+brain_lesion/
+False_positive_control/
+GRF_data/
+simulation_approximate_model/
+real_data/
+*.png
+
 # Bash/shell scripts
 *.sh
 

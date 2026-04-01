@@ -4,10 +4,7 @@ This repository contains code and experiments for brain lesion analysis using sp
 
 ## Project Structure
 
-- `brain_lesion/`: Core brain lesion analysis modules
 - `experiment/`: Experimental scripts and analysis code
-- `real_data/`: Real brain imaging data processing (excluded from git)
-- `simulation_approximate_model/`: Simulation studies with approximate models
 
 ## Key Files
 
