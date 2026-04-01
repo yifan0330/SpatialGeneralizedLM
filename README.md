@@ -1,4 +1,4 @@
-# Brain Lesion Project
+# Efficient Brain Lesion Estimation
 
 This repository contains code and experiments for brain lesion analysis using spatial statistical models.
 
