@@ -1,5 +1,6 @@
 # SpatialGeneralizedLM
-This repository implements efficient spatial statistical models for brain lesion analysis, including Kronecker-structured spatial GLMs, mass-univariate regression, and robust sandwich-based inference — designed to scale to UK Biobank-sized datasets without materialising the full design matrix.
+
+This repository implements computationally efficient spatial statistical models for brain lesion map analysis, including Kronecker-structured spatial GLMs and robust sandwich-based inference. Compared with mass-univariate regression as a baseline model, it is designed to scale to UK Biobank–sized datasets without requiring the full design matrix, whose dimensions are the product of the number of voxels and the number of subjects.
 
 ## Methods & Algorithms
 
@@ -7,7 +8,7 @@ This repository implements efficient spatial statistical models for brain lesion
 
 | Model | Description |
 |-------|-------------|
-| **Spatial Brain Lesion Model** | Kronecker-structured (multiplicative) spatial GLM: the mean function factorises as *μ = g⁻¹(Z β Bᵀ)* where *Z* = subject covariates, *B* = spatial B-spline bases, and *β* = coefficient matrix. Supports Bernoulli and Poisson marginals with logit / log / arctanh links. |
+| **Spatial Brain Lesion Model** | Kronecker-structured (multiplicative) spatial GLM: the mean function factorises as *μ = g⁻¹(Z β Bᵀ)* where *Z* = subject covariates, *B* = spatial B-spline bases, and *β* = coefficient matrix. Supports Poisson and Negative Binomial (NB) model with log links. |
 | **Mass Univariate Regression** | Standard voxel-wise GLM *μ = g⁻¹(Z β)* with independent *β* per voxel. Optional **Firth penalisation** (Jeffrey's prior) via ½ log det I(β) added to the negative log-likelihood. |
 
 ### Spatial Basis Functions (`experiment/bspline.py`)
