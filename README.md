@@ -1,6 +1,6 @@
 # SpatialGeneralizedLM
 
-This repository implements computationally efficient spatial statistical models for brain lesion map analysis, including Kronecker-structured spatial GLMs and robust sandwich-based inference. Compared with mass-univariate regression as a baseline model, it is designed to scale to UK Biobank–sized datasets without requiring the full design matrix, whose dimensions are the product of the number of voxels and the number of subjects.
+This repository implements computationally efficient spatial statistical models for brain lesion map analysis, including Kronecker-structured spatial GLMs and robust sandwich-based inference. Compared with mass-univariate regression as a baseline model, it is designed to scale to large-scale datasets (e.g. UK Biobank) without requiring the full design matrix, whose dimensions are the product of the number of voxels and the number of subjects.
 
 ## Methods & Algorithms
 
@@ -13,7 +13,7 @@ This repository implements computationally efficient spatial statistical models 
 
 ### Spatial Basis Functions (`experiment/bspline.py`)
 
-- **Tensor-product B-splines** — recursive Cox–de Boor evaluation in 1D/2D/3D, with brain-mask subsetting and removal of weakly-supported bases.
+- **Tensor-product B-splines** — recursive evaluation in 1D/2D/3D, with brain-mask subsetting and removal of weakly-supported bases.
 - **Random Fourier Features (RFF)** — *φ(x) = √(2/D) cos(ωᵀx + b)* approximating an RBF kernel.
 - **Quasi-Monte Carlo Fourier Features** — Sobol-sequence-based frequency sampling for improved coverage.
 
