@@ -61,20 +61,45 @@ class SpatialBrainLesionModel(nn.Module):
 
 
     def forward(self, X, Y, Z):
-        n_subject = Z.shape[0]
-        # Compute intensity function
-        P = self.inverse_link_func(Z @ self.beta.T @ X.T) # shape: (n_subject, n_voxel)
+        """Compute predicted probabilities for each group.
 
-        return P
-    
+        Parameters
+        ----------
+        X : dict[str, Tensor] or Tensor  – spatial design matrices
+        Y : dict[str, Tensor] or Tensor  – observed outcomes
+        Z : dict[str, Tensor] or Tensor  – subject covariates
+
+        Returns
+        -------
+        dict[str, Tensor] or Tensor – predicted probabilities per group
+        """
+        if isinstance(Z, dict):
+            P = {}
+            for group_name in Z:
+                P[group_name] = self.inverse_link_func(
+                    Z[group_name] @ self.beta.T @ X[group_name].T
+                )
+            return P
+        # Single-group backward compatibility
+        return self.inverse_link_func(Z @ self.beta.T @ X.T)
+
     def get_loss(self, P, Y, Z):
-        # equal weights for all voxels
-        weights = torch.ones(Y.shape[1], device=self.device)
+        """Compute total NLL summed across all groups."""
+        if isinstance(Y, dict):
+            total_nll = 0.0
+            for group_name in Y:
+                total_nll += self._group_nll(P[group_name], Y[group_name])
+            return total_nll
+        return self._group_nll(P, Y)
+
+    def _group_nll(self, P, Y):
+        """Compute NLL for a single group."""
         if self.marginal_dist == "Bernoulli":
-            nll = -(weights*torch.log(P) * Y + weights*torch.log(1 - P) * (1 - Y)).mean()
+            nll = -(torch.log(P) * Y + torch.log(1 - P) * (1 - Y)).mean()
         elif self.marginal_dist == "Poisson":
             nll = -(Y * torch.log(P) - P).mean()
-        print(torch.min(P), torch.max(P), "P range")
+        else:
+            raise ValueError(f"Marginal distribution {self.marginal_dist} not supported")
         return nll
 
     def _neg_log_likelihood(marginal_dist, link_func, regression_terms, 
@@ -131,53 +156,89 @@ class MassUnivariateRegression(nn.Module):
         self.beta = nn.Parameter(torch.randn(n_voxels, self.n_covariates, **self._kwargs) * self.std_params)
 
     def forward(self, X, Y, Z):
+        """Compute predicted probabilities for each group.
+
+        Parameters
+        ----------
+        X : dict[str, Tensor] or Tensor  – spatial design matrices (unused but kept for API)
+        Y : dict[str, Tensor] or Tensor  – observed outcomes
+        Z : dict[str, Tensor] or Tensor  – subject covariates
+
+        Returns
+        -------
+        dict[str, Tensor] or Tensor – predicted probabilities per group
+        """
+        if isinstance(Z, dict):
+            self.X = X
+            P = {}
+            for group_name in Z:
+                P[group_name] = self.inverse_link_func(
+                    Z[group_name] @ self.beta.T
+                )
+            return P
         self.X = X
         self.n_subject = Z.shape[0]
-        # Compute intensity function
-        P = self.inverse_link_func(Z @ self.beta.T) # shape: (n_subject, n_voxels)
-        return P
-    
+        return self.inverse_link_func(Z @ self.beta.T)
+
     def get_loss(self, P, Y, Z, eps=1e-6):
-        # equal weights for all voxels
-        weights = torch.ones(Y.shape[1], device=self.device)
+        """Compute total NLL summed across all groups, with optional Firth penalty."""
+        if isinstance(Y, dict):
+            total_nll = 0.0
+            for group_name in Y:
+                total_nll += self._group_nll(P[group_name], Y[group_name])
+            if self.firth_penalty:
+                # Firth penalty uses all groups concatenated
+                P_all = torch.cat([P[g] for g in Y], dim=0)
+                Z_all = torch.cat([Z[g] for g in Z], dim=0)
+                total_nll += self._firth_penalty(P_all, Z_all, eps)
+            return total_nll
+        nll = self._group_nll(P, Y)
+        if self.firth_penalty:
+            nll += self._firth_penalty(P, Z, eps)
+        return nll
+
+    def _group_nll(self, P, Y):
+        """Compute NLL for a single group."""
         if self.marginal_dist == "Bernoulli":
-            nll = -(weights*torch.log(P) * Y + weights*torch.log(1 - P) * (1 - Y)).mean()
+            nll = -(torch.log(P) * Y + torch.log(1 - P) * (1 - Y)).mean()
         elif self.marginal_dist == "Poisson":
             nll = -(Y * torch.log(P) - P).mean()
-        print("NLL:", nll.item())
-        # start_time = time.time()
-        if self.firth_penalty:
-            # Memory-efficient vectorized computation using chunking
-            # Precompute eye for regularization
-            eye_reg = torch.eye(self.n_covariates, device=self.device) * eps
-            total_penalty = 0.0
-            
-            for voxel_idx in range(self.n_voxels):
-                # print(voxel_idx, self.n_voxels)
-                # Get probabilities for this voxel
-                p_voxel = P[:, voxel_idx]  # (n_subjects,) 
-                
-                # Fisher Information for logistic/Poisson regression at this voxel
-                weights = p_voxel * (1 - p_voxel) if self.marginal_dist == "Bernoulli" else p_voxel if self.marginal_dist == "Poisson" else None
-                sqrt_weights = torch.sqrt(weights)
-                
-                # Weighted design matrix
-                Z_weighted = Z * sqrt_weights[:, None]  # (n_subjects, n_covariates)
-                # Fisher Information matrix (n_covariates, n_covariates)
-                FI = torch.mm(Z_weighted.t(), Z_weighted)
-                FI += eye_reg
-                # Cholesky
-                L = torch.linalg.cholesky(FI)                # FI = L L^T
-                # logdet(FI) = 2 * sum(log(diag(L)))
-                half_logdet = torch.log(torch.diagonal(L)).sum()
-                total_penalty += half_logdet
-                del L, FI, Z_weighted, p_voxel, sqrt_weights, weights
-            
-            # print(time.time() - start_time, "seconds for Firth penalty computation")
-            nll += total_penalty
-            print(f"Total Firth penalty: {total_penalty}")
-            
+        else:
+            raise ValueError(f"Marginal distribution {self.marginal_dist} not supported")
         return nll
+
+    def _firth_penalty(self, P, Z, eps=1e-6):
+        """Compute the Firth (half-log-det FI) penalty across all subjects."""
+        # Precompute eye for regularization
+        eye_reg = torch.eye(self.n_covariates, device=self.device) * eps
+        total_penalty = 0.0
+
+        for voxel_idx in range(self.n_voxels):
+            # Get probabilities for this voxel
+            p_voxel = P[:, voxel_idx]  # (n_subjects,)
+
+            # Fisher Information for logistic/Poisson regression at this voxel
+            if self.marginal_dist == "Bernoulli":
+                weights = p_voxel * (1 - p_voxel)
+            elif self.marginal_dist == "Poisson":
+                weights = p_voxel
+            else:
+                raise ValueError(f"Marginal distribution {self.marginal_dist} not supported")
+            sqrt_weights = torch.sqrt(weights)
+
+            # Weighted design matrix
+            Z_weighted = Z * sqrt_weights[:, None]  # (n_subjects, n_covariates)
+            # Fisher Information matrix (n_covariates, n_covariates)
+            FI = torch.mm(Z_weighted.t(), Z_weighted)
+            FI += eye_reg
+            # Cholesky
+            L = torch.linalg.cholesky(FI)  # FI = L L^T
+            # logdet(FI) = 2 * sum(log(diag(L)))
+            half_logdet = torch.log(torch.diagonal(L)).sum()
+            total_penalty += half_logdet
+            del L, FI, Z_weighted, p_voxel, sqrt_weights, weights
+
+        return total_penalty
 
     def _neg_log_likelihood(marginal_dist, link_func, regression_terms, 
                             X_spatial, Y, Z, beta_param, beta_other, device="cpu"):

@@ -94,6 +94,10 @@ args = get_args()
 SUPPORTED_MODELS = {"MassUnivariateRegression", "SpatialBrainLesion"}
 if args.model not in SUPPORTED_MODELS:
     raise ValueError(f"Model '{args.model}' is not supported. Supported models are: {', '.join(sorted(SUPPORTED_MODELS))}")
+if args.group_names and len(args.group_names) != args.n_group:
+    raise ValueError(f"Number of group names ({len(args.group_names)}) does not match number of groups ({args.n_group})")
+
+
 
 simulated_dset = args.simulated_dset
 n_subjects_whole_UKB = 13677
@@ -102,7 +106,7 @@ homogeneous = args.homogeneous
 space_dim = args.space_dim
 spacing = args.spacing
 n_group = args.n_group
-group_names = args.group_names
+group_names = args.group_names if args.group_names else [f"Group_{i+1}" for i in range(n_group)]
 n_subject = args.n_subject
 lesion_per_subject = args.lesion_per_subject
 polynomial_order = args.polynomial_order
@@ -203,12 +207,13 @@ def _build_simulated_brain_filenames(base_path, space_dim, model, filename_compo
     common_suffix = f"{filename_components['dset']}{filename_components['model']}{filename_components['poly']}_{model}_{optimization_params['marginal']}_{optimization_params['link']}_link_func"
     
     filenames = {
-        "data_filename": f"{base_path}/data/{space_dim}/data{filename_components['dset']}.npz",
+        "data_filename": f"{base_path}/data/{space_dim}/data{filename_components['dset']}/GRF_{args.n_subject}/GRF_{args.n_subject}_random_seed_{args.random_seed}.npz",
         "smooth_lesion_mask_filename": f"{base_path}/data/{space_dim}/smooth_lesion_mask{filename_components['dset']}.nii.gz",
         "results_filename": f"{base_path}/results/{space_dim}/GRF_{args.n_subject}/{model_params}/{space_dim}_Regression{filename_components['dset']}{filename_components['model']}{filename_components['poly']}_random_seed_{args.random_seed}.npz",
-        "inference_filename": f"{base_path}/inference/{space_dim}/GRF_{args.n_subject}/{model_params}/{space_dim}_Inference_{args.inference_method}{filename_components['dset']}{filename_components['model']}{filename_components['poly']}.npz",
-        "lesion_estimation_map_filename": f"{base_path}/results/{space_dim}/sqrt_P_mean{common_suffix}.png",
-        "fig_filename": f"{base_path}/figures/PP-plots/{space_dim}/{space_dim}_PP_plot_{args.inference_method}{common_suffix}.png",
+        "inference_filename": f"{base_path}/inference/{space_dim}/GRF_{args.n_subject}/{model_params}/{space_dim}_Inference_{args.inference_method}{filename_components['dset']}{filename_components['model']}{filename_components['poly']}_random_seed_{args.random_seed}.npz",
+        "lesion_estimation_map_filename": f"{base_path}/results/{space_dim}/sqrt_P_mean{common_suffix}_random_seed_{args.random_seed}.png",
+        "fig_filename": f"{base_path}/figures/PP-plots/{space_dim}/GRF_{args.n_subject}/{space_dim}_PP_plot_{args.inference_method}{common_suffix}_random_seed_{args.random_seed}.png",
+    
     }
     
     # Create directories
@@ -266,7 +271,7 @@ meat_term_filename = filenames_dict.get("meat_term_filename")
 bread_term_filename = filenames_dict.get("bread_term_filename")
 
 logging.info(f"load brain mask ...")
-brain_mask_path = os.path.dirname(os.getcwd()) + "/real_data/MNI152_T1_2mm_brain_mask.nii.gz"
+brain_mask_path = os.path.dirname(os.getcwd()) + "/GRF_data/MNI152_T1_2mm_brain_mask.nii.gz"
 brain_mask = nib.load(brain_mask_path) if space_dim == "brain" else None
 smooth_lesion_mask = nib.load(smooth_lesion_mask_filename) if smooth_lesion_mask_filename and os.path.exists(smooth_lesion_mask_filename) else None
 n_voxels = np.sum(smooth_lesion_mask.get_fdata() > 0)
@@ -275,13 +280,14 @@ if args.run_data_generation:
     logging.info(f"Generate data{filename_components['dset']}...")
     # Check if spatial design matrix exists
     if simulated_dset:
+        print(data_filename)
         if os.path.exists(data_filename):
             X_spatial = np.load(data_filename)["X_spatial"]
         else:
             brain_mask = None if isinstance(space_dim, int) else brain_mask
             # create data file 
             os.makedirs(os.path.dirname(data_filename), exist_ok=True)
-            X_spatial = B_spline_bases(space_dim=space_dim, dim=n_voxels, brain_mask=smooth_lesion_mask, spacing=spacing, dtype=np.float64)
+            X_spatial = QMCFeatures_3D(brain_mask=smooth_lesion_mask, length_scale=1.0, n_features=400)
             np.savez(data_filename, X_spatial=X_spatial)
     else: 
         if os.path.exists(smooth_lesion_mask_filename):
@@ -347,27 +353,22 @@ if args.run_regression:
         else:
             data = np.load(masked_data_filename, allow_pickle=True)
         data = {key: data[key] for key in data.files}
-    #######################
-    # subset data for testing model performance
-    if UKB_subject < n_subjects_whole_UKB:
-        np.random.seed(42)
-        selected_indices = np.random.choice(n_subjects_whole_UKB, size=UKB_subject, replace=False)
-        # total_needed = 5 * UKB_subject
-        # all_selected_indices = np.random.choice(n_subjects_whole_UKB, size=total_needed, replace=False)
-        # selected_indices = all_selected_indices[4*UKB_subject:]
-        data["Y"] = data["Y"][selected_indices]
-        data["Z"] = data["Z"][selected_indices]
-    #######################
+    if not simulated_dset and space_dim == "brain":
+        #######################
+        # subset data for testing model performance
+        if UKB_subject < n_subjects_whole_UKB:
+            np.random.seed(42)
+            selected_indices = np.random.choice(n_subjects_whole_UKB, size=UKB_subject, replace=False)
+            # total_needed = 5 * UKB_subject
+            # all_selected_indices = np.random.choice(n_subjects_whole_UKB, size=total_needed, replace=False)
+            # selected_indices = all_selected_indices[4*UKB_subject:]
+            data["Y"] = data["Y"][selected_indices]
+            data["Z"] = data["Z"][selected_indices]
+        #######################
     # add cubic terms to Z
-    data["Z"] = preprocess_Z(simulated_dset, data["Z"], polynomial_order)
-    # # smoothing
-    # # append one subject with all-zero and one-subject with all-one lesion mask
-    # if model == "SpatialBrainLesion":
-    #         data["Y"] = np.concatenate([data["Y"], [0.5*np.ones_like(data["Y"][0])]], axis=0)
-    #         data["Z"] = np.concatenate(
-    #                                     [data["Z"], np.array([0, 0, 0, 0, 0]).reshape(1, -1)],
-    #                                     axis=0
-    #                                 )
+    for group_name in group_names:
+        data[group_name].item()["Z"] = preprocess_Z(simulated_dset, data[group_name].item()["Z"], polynomial_order)
+
     result = {}
     if args.full_model:
         if not os.path.exists(results_filename):
@@ -389,16 +390,31 @@ if args.run_regression:
             print(f"Optimization time: {time.time() - start_time} seconds")
             # save optimised params
             beta = BR.model.beta.detach().cpu().numpy()
-            P = BR.model(BR.B, BR.Y, BR.Z).detach().cpu().numpy()
-            result = {"beta": beta, "P": P}
+            MU_dict = BR.model(BR.B, BR.Y, BR.Z)
+            if isinstance(MU_dict, dict):
+                MU_mean = {g: mu.detach().cpu().numpy().mean(axis=0) for g, mu in MU_dict.items()}
+                MU_std = {g: mu.detach().cpu().numpy().std(axis=0) for g, mu in MU_dict.items()}
+                MU_np = {g: mu.detach().cpu().numpy() for g, mu in MU_dict.items()}
+                P = {g: MU_np[g] * np.exp(-MU_np[g]) for g in MU_np}
+            else:
+                MU_np = MU_dict.detach().cpu().numpy()
+                MU_mean = MU_np.mean(axis=0)
+                MU_std = MU_np.std(axis=0)
+                P = MU_np * np.exp(-MU_np)
+            result = {"beta": beta, "P": P, "MU_mean": MU_mean, "MU_std": MU_std}
             print(results_filename)
             np.savez(results_filename, **result)
         else:
             print(results_filename)
             logging.info(f"Results file {results_filename} already exists. Skipping regression.")
             beta = np.load(results_filename, allow_pickle=True)["beta"]
-            P = np.load(results_filename, allow_pickle=True)["P"]
-            P_mean = np.mean(P, axis=0)
+            P_raw = np.load(results_filename, allow_pickle=True)["P"]
+            P_dict = P_raw.item() if P_raw.ndim == 0 else P_raw
+            if isinstance(P_dict, dict):
+                first_group = list(P_dict.keys())[0]
+                P_mean = np.mean(P_dict[first_group], axis=0)
+            else:
+                P_mean = np.mean(P_dict, axis=0)
             plot_brain(p=np.sqrt(P_mean), brain_mask=smooth_lesion_mask, vmax=None, output_filename=os.getcwd() + f"/test.png")
     else:
         print("herehere")
@@ -451,26 +467,22 @@ if args.run_inference:
         else:
             data = np.load(masked_data_filename, allow_pickle=True)
         data = {key: data[key] for key in data.files}
-    #######################
-    if UKB_subject < n_subjects_whole_UKB:
-        np.random.seed(42)
-        selected_indices = np.random.choice(n_subjects_whole_UKB, size=UKB_subject, replace=False)
-        # total_needed = 5 * UKB_subject
-        # all_selected_indices = np.random.choice(n_subjects_whole_UKB, size=total_needed, replace=False)
-        # selected_indices = all_selected_indices[4*UKB_subject:]
-        data["Y"] = data["Y"][selected_indices]
-        data["Z"] = data["Z"][selected_indices]
-    #######################
+    if not simulated_dset and space_dim == "brain":
+        #######################
+        # subset data for testing model performance
+        if UKB_subject < n_subjects_whole_UKB:
+            np.random.seed(42)
+            selected_indices = np.random.choice(n_subjects_whole_UKB, size=UKB_subject, replace=False)
+            # total_needed = 5 * UKB_subject
+            # all_selected_indices = np.random.choice(n_subjects_whole_UKB, size=total_needed, replace=False)
+            # selected_indices = all_selected_indices[4*UKB_subject:]
+            data["Y"] = data["Y"][selected_indices]
+            data["Z"] = data["Z"][selected_indices]
+        #######################
     # add cubic terms to Z
-    data["Z"] = preprocess_Z(simulated_dset, data["Z"], polynomial_order)
-    # # smoothing
-    # # append one subject with all-zero and one-subject with all-one lesion mask
-    # if model == "SpatialBrainLesion":
-    #         data["Y"] = np.concatenate([data["Y"], [0.5*np.ones_like(data["Y"][0])]], axis=0)
-    #         data["Z"] = np.concatenate(
-    #                                     [data["Z"], np.array([0, 0, 0, 0, 0]).reshape(1, -1)],
-    #                                     axis=0
-    #                                 )
+    for group_name in group_names:
+        data[group_name].item()["Z"] = preprocess_Z(simulated_dset, data[group_name].item()["Z"], polynomial_order)
+
     # load optimised params
     print("results: ", results_filename)
     results = np.load(results_filename, allow_pickle=True)

@@ -38,34 +38,56 @@ class BrainRegression_full:
     def load_data(self, data):
         """Load and prepare data tensors (Y, B with intercept, Z with intercept)."""
         # load MU, X, Y, Z
-        if "MU" in data and data["MU"] is not None:
-            self.MU = torch.tensor(data["MU"], **self._kwargs)
-            # self.MU = self.MU[subsampled_subjects, :]
-        # Load X_spatial and add intercept
-        B = torch.tensor(data["X_spatial"], **self._kwargs)
-        self.B = torch.cat([B, torch.ones((B.shape[0], 1), **self._kwargs)], dim=1)
-        Z = torch.tensor(data["Z"], **self._kwargs)
-        self.Z = torch.cat([Z, torch.ones((Z.shape[0], 1), **self._kwargs)], dim=1)
-        self.Y = torch.tensor(data["Y"], **self._kwargs)
+        group_names = list(data.keys())
+        B, Z, Y = dict(), dict(), dict()
+        for group_name in group_names:
+            # Load X_spatial and add intercept
+            B[group_name] = torch.tensor(data[group_name].item()["X_spatial"], **self._kwargs)
+            B[group_name] = torch.cat([B[group_name], torch.ones((B[group_name].shape[0], 1), **self._kwargs)], dim=1)
+            Z[group_name] = torch.tensor(data[group_name].item()["Z"], **self._kwargs)
+            Z[group_name] = torch.cat([Z[group_name], torch.ones((Z[group_name].shape[0], 1), **self._kwargs)], dim=1)
+            Y[group_name] = torch.tensor(data[group_name].item()["Y"], **self._kwargs)
+        self.B, self.Z, self.Y = B, Z, Y
         # Dimensions
-        self.n_subjects, self.n_covariates = self.Z.shape
-        self.n_voxels, self.n_bases = self.B.shape
+        n_subjects, n_covariates, n_voxels, n_bases = dict(), dict(), dict(), dict()
+        for group_name in group_names:
+            n_subjects[group_name], n_covariates[group_name] = self.Z[group_name].shape
+            n_voxels[group_name], n_bases[group_name] = self.B[group_name].shape
+        self.n_subjects, self.n_covariates = n_subjects, n_covariates
+        self.n_voxels, self.n_bases = n_voxels, n_bases
+        # if there are multiple groups, check that they have the same number of voxels, bases, and covariates
+        if len(group_names) > 1:
+            n_voxels_set = set(n_voxels[group_name] for group_name in group_names)
+            n_bases_set = set(n_bases[group_name] for group_name in group_names)
+            n_covariates_set = set(n_covariates[group_name] for group_name in group_names)
+            if len(n_voxels_set) > 1:
+                raise ValueError(f"Groups have different number of voxels: {n_voxels}")
+            if len(n_bases_set) > 1:
+                raise ValueError(f"Groups have different number of bases: {n_bases}")
+            if len(n_covariates_set) > 1:
+                raise ValueError(f"Groups have different number of covariates: {n_covariates}")
+
+        # Use first group's dimensions (validated equal across groups)
+        first_group = group_names[0]
+        self.n_voxels_scalar = n_voxels[first_group]
+        self.n_bases_scalar = n_bases[first_group]
+        self.n_covariates_scalar = n_covariates[first_group]
 
     def init_model(self, model_name, **kwargs):
         """Instantiate the specified model with the given keyword arguments."""
         if model_name == "SpatialBrainLesion":
-            self.model = SpatialBrainLesionModel(n_covariates=self.n_covariates, 
+            self.model = SpatialBrainLesionModel(n_covariates=self.n_covariates_scalar, 
                                                 n_auxiliary=kwargs["n_auxiliary"], 
                                                 std_auxiliary=kwargs["std_auxiliary"],
                                                 n_samples=kwargs["n_samples"],
                                                 regression_terms=kwargs["regression_terms"],
                                                 link_func=kwargs["link_func"],
                                                 marginal_dist=kwargs["marginal_dist"],
-                                                n_bases=self.n_bases,
+                                                n_bases=self.n_bases_scalar,
                                                 device=self.device, 
                                                 dtype=self.dtype)
         elif model_name == "MassUnivariateRegression":
-            self.model = MassUnivariateRegression(n_covariates=self.n_covariates, 
+            self.model = MassUnivariateRegression(n_covariates=self.n_covariates_scalar, 
                                                 n_auxiliary=kwargs["n_auxiliary"], 
                                                 std_auxiliary=kwargs["std_auxiliary"],
                                                 n_samples=kwargs["n_samples"],
@@ -73,7 +95,7 @@ class BrainRegression_full:
                                                 link_func=kwargs["link_func"],
                                                 marginal_dist=kwargs["marginal_dist"],
                                                 firth_penalty=kwargs['firth_penalty'],
-                                                n_voxels=self.n_voxels,
+                                                n_voxels=self.n_voxels_scalar,
                                                 device=self.device, 
                                                 dtype=self.dtype)
         else:

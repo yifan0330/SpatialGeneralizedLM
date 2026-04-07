@@ -292,7 +292,7 @@ class GRF_simulated_data(object):
         self.group_names = group_names
         self.n_group = n_group
         self.GRF_data_dir = GRF_data_dir
-        self.n_subject = n_subject[0] if len(n_subject) == 1 else n_subject
+        self.n_subject = n_subject
         # check if data directory exists
         if not os.path.exists(self.GRF_data_dir):
             raise ValueError(f"GRF data directory {self.GRF_data_dir} doesn't exist")
@@ -360,7 +360,6 @@ class GRF_simulated_data(object):
         for i in range(self.n_group):
             n = self.n_subject[i]
             group_name = self.group_names[i]
-            print("n=", n, group_name)
             ages = rng_age.uniform(low=low, high=high, size=n)
             ages = np.round(np.sort(ages), 2)
             # create empty dict and arrays
