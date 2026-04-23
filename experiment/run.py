@@ -187,10 +187,11 @@ def _build_simulated_1d3d_filenames(base_path, space_dim, filename_components, o
     """Build filenames for 1D/2D/3D simulated data."""
     dim_str = f"{space_dim}D"
     common_suffix = f"{filename_components['homo']}{filename_components['model']}_{n_group}_group_{n_subject}_{optimization_params['marginal']}_{optimization_params['link']}_link_func"
+    result_suffix = f"{common_suffix}_{optimization_params['gradient']}_{optimization_params['precond']}"
     
     filenames = {
         "data_filename": f"{base_path}/data/{dim_str}/{dim_str}_data{filename_components['dset']}{filename_components['homo']}_{n_group}_group_{n_subject}_{optimization_params['marginal']}_{optimization_params['link']}_link_func.npz",
-        "results_filename": f"{base_path}/results/{dim_str}/{dim_str}_Regression{filename_components['dset']}{common_suffix}.npz",
+        "results_filename": f"{base_path}/results/{dim_str}/{dim_str}_Regression{filename_components['dset']}{result_suffix}.npz",
         "inference_filename": f"{base_path}/inference/{dim_str}/{dim_str}_Inference_{args.inference_method}{filename_components['dset']}{common_suffix}.npz",
         "fig_filename": f"{base_path}/figures/PP-plots/{dim_str}/{dim_str}_PP_plot_{args.inference_method}{filename_components['dset']}{common_suffix}.png",
     }
@@ -205,11 +206,12 @@ def _build_simulated_brain_filenames(base_path, space_dim, model, filename_compo
     """Build filenames for brain (spatial) simulated data."""
     model_params = f"{model}_{optimization_params['marginal']}_{optimization_params['link']}"
     common_suffix = f"{filename_components['dset']}{filename_components['model']}{filename_components['poly']}_{model}_{optimization_params['marginal']}_{optimization_params['link']}_link_func"
+    result_suffix = f"{filename_components['dset']}{filename_components['model']}{filename_components['poly']}_{optimization_params['gradient']}_{optimization_params['precond']}_random_seed_{args.random_seed}"
     
     filenames = {
         "data_filename": f"{base_path}/data/{space_dim}/data{filename_components['dset']}/GRF_{args.n_subject}/GRF_{args.n_subject}_random_seed_{args.random_seed}.npz",
         "smooth_lesion_mask_filename": f"{base_path}/data/{space_dim}/smooth_lesion_mask{filename_components['dset']}.nii.gz",
-        "results_filename": f"{base_path}/results/{space_dim}/GRF_{args.n_subject}/{model_params}/{space_dim}_Regression{filename_components['dset']}{filename_components['model']}{filename_components['poly']}_random_seed_{args.random_seed}.npz",
+        "results_filename": f"{base_path}/results/{space_dim}/GRF_{args.n_subject}/{model_params}/{space_dim}_Regression{result_suffix}.npz",
         "inference_filename": f"{base_path}/inference/{space_dim}/GRF_{args.n_subject}/{model_params}/{space_dim}_Inference_{args.inference_method}{filename_components['dset']}{filename_components['model']}{filename_components['poly']}_random_seed_{args.random_seed}.npz",
         "lesion_estimation_map_filename": f"{base_path}/results/{space_dim}/sqrt_P_mean{common_suffix}_random_seed_{args.random_seed}.png",
         "fig_filename": f"{base_path}/figures/PP-plots/{space_dim}/GRF_{args.n_subject}/{space_dim}_PP_plot_{args.inference_method}{common_suffix}_random_seed_{args.random_seed}.png",
@@ -282,19 +284,21 @@ if args.run_data_generation:
     if simulated_dset:
         print(data_filename)
         if os.path.exists(data_filename):
-            X_spatial = np.load(data_filename)["X_spatial"]
+            data = np.load(data_filename, allow_pickle=True)
+            X_spatial = data[data.files[0]].item()["X_spatial"]
         else:
             brain_mask = None if isinstance(space_dim, int) else brain_mask
             # create data file 
             os.makedirs(os.path.dirname(data_filename), exist_ok=True)
-            X_spatial = QMCFeatures_3D(brain_mask=smooth_lesion_mask, length_scale=1.0, n_features=400)
+            # X_spatial = B_spline_bases(space_dim=space_dim, dim=n_voxels, brain_mask=smooth_lesion_mask, spacing=spacing, dtype=np.float64)
+            X_spatial = QMCFeatures_3D(brain_mask=smooth_lesion_mask, length_scale=1.0, n_features=445)
             np.savez(data_filename, X_spatial=X_spatial)
     else: 
         if os.path.exists(smooth_lesion_mask_filename):
             smooth_lesion_mask = nib.load(smooth_lesion_mask_filename)
-            X_spatial = QMCFeatures_3D(brain_mask=smooth_lesion_mask, length_scale=1.0, n_features=400)
+            # X_spatial = QMCFeatures_3D(brain_mask=smooth_lesion_mask, length_scale=1.0, n_features=445)
             # X_spatial = RandomFourierFeatures_3D(space_dim=space_dim, dim=n_voxels, brain_mask=smooth_lesion_mask, n_features=800, sigma=0.1)
-            # X_spatial = B_spline_bases(space_dim=space_dim, dim=n_voxel, brain_mask=smooth_lesion_mask, spacing=spacing, dtype=np.float64
+            X_spatial = B_spline_bases(space_dim=space_dim, dim=n_voxels, brain_mask=smooth_lesion_mask, spacing=spacing, dtype=np.float64)
     if simulated_dset:
         if isinstance(space_dim, int):
             lesion_size_mapping = {
@@ -336,14 +340,15 @@ if args.run_data_generation:
             Z, Y = masked_data.process_data(smooth_lesion_mask_filename)
             data = dict(X_spatial=X_spatial, Y=Y, Z=Z)
             np.savez(masked_data_filename, **data)
-        data = np.load(masked_data_filename, allow_pickle=True)
-        data = {key: data[key] for key in data.files}
-        print(data["X_spatial"])
-        print(data["X_spatial"].shape)
-        data["X_spatial"] = X_spatial
-        print(data["X_spatial"].shape)
-        np.savez(masked_data_filename, **data)
         exit()
+        # data = np.load(masked_data_filename, allow_pickle=True)
+        # data = {key: data[key] for key in data.files}
+        # print(data["X_spatial"])
+        # print(data["X_spatial"].shape)
+        # data["X_spatial"] = X_spatial
+        # print(data["X_spatial"].shape)
+        # np.savez(masked_data_filename, **data)
+        # exit()
 
 if args.run_regression:
     logging.info("Setup model and optimise regression coefficients")
@@ -368,7 +373,6 @@ if args.run_regression:
     # add cubic terms to Z
     for group_name in group_names:
         data[group_name].item()["Z"] = preprocess_Z(simulated_dset, data[group_name].item()["Z"], polynomial_order)
-
     result = {}
     if args.full_model:
         if not os.path.exists(results_filename):
@@ -389,7 +393,10 @@ if args.run_regression:
             BR.optimize_model(lr, iter, tolerance_change)
             print(f"Optimization time: {time.time() - start_time} seconds")
             # save optimised params
-            beta = BR.model.beta.detach().cpu().numpy()
+            if hasattr(BR.model, 'betas') and BR.model.betas is not None:
+                beta = {g: BR.model.betas[g].detach().cpu().numpy() for g in BR.model.betas}
+            else:
+                beta = BR.model.beta.detach().cpu().numpy()
             MU_dict = BR.model(BR.B, BR.Y, BR.Z)
             if isinstance(MU_dict, dict):
                 MU_mean = {g: mu.detach().cpu().numpy().mean(axis=0) for g, mu in MU_dict.items()}
@@ -428,6 +435,7 @@ if args.run_regression:
         BR.load_data(data, model)
         if not os.path.exists(results_filename):
             alpha = 0.01
+            start_time = time.time()
             beta = BR.run_regression(model=model,
                                     marginal_dist=args.marginal_dist,
                                     link_func=args.link_func,
@@ -437,6 +445,7 @@ if args.run_regression:
                                     preconditioner_mode=args.preconditioner_mode,
                                     block_size=5000,
                                     compute_nll=True)
+            print(f"Regression optimization time: {time.time() - start_time} seconds")
             MU_mean, MU_std, P_mean = BR.goodness_of_fit(beta=beta, model=model, mode="dask", block_size=5000)
             print('result_name:', results_filename)
             print('fig_name:', filenames_dict['lesion_estimation_map_filename'])
@@ -508,7 +517,7 @@ if args.run_inference:
         BI.create_contrast(contrast_vector=args.contrast_vector, contrast_name=args.contrast_name,
                            polynomial_order=polynomial_order)
         if simulated_dset:
-            BI.run_inference(method=args.inference_method, fig_filename=fig_filename)
+            BI.run_inference(method=args.inference_method, inference_filename=inference_filename, fig_filename=fig_filename)
         else:
             BI.run_inference(method=args.inference_method, lesion_mask=smooth_lesion_mask, 
                             XTWX_filename=XTWX_filename, Fisher_info_filename=Fisher_info_filename,

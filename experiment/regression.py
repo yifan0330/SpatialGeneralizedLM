@@ -72,6 +72,7 @@ class BrainRegression_full:
         self.n_voxels_scalar = n_voxels[first_group]
         self.n_bases_scalar = n_bases[first_group]
         self.n_covariates_scalar = n_covariates[first_group]
+        self.group_names = group_names
 
     def init_model(self, model_name, **kwargs):
         """Instantiate the specified model with the given keyword arguments."""
@@ -84,6 +85,7 @@ class BrainRegression_full:
                                                 link_func=kwargs["link_func"],
                                                 marginal_dist=kwargs["marginal_dist"],
                                                 n_bases=self.n_bases_scalar,
+                                                group_names=self.group_names,
                                                 device=self.device, 
                                                 dtype=self.dtype)
         elif model_name == "MassUnivariateRegression":
@@ -115,7 +117,6 @@ class BrainRegression_full:
                                             tolerance_change=tolerance_change,
                                             history_size=history_size, 
                                             line_search_fn=line_search_fn)
-
         def closure():
             optimizer.zero_grad()
             preds = self.model(self.B, self.Y, self.Z)
@@ -139,17 +140,65 @@ class BrainRegression_Approximate:
         self.device = device  
 
     def load_data(self, data, model):
-        """Load and prepare data arrays (Y, B with intercept, Z with intercept)."""
-        B, Z = data["X_spatial"], data["Z"]
-        B = B.astype(np.float64)
-        B = B * 50 / B.shape[0]
-        Z = Z * 50 / Z.shape[0]
-        self.B = np.concatenate([B, np.ones((B.shape[0], 1))], axis=1)
-        self.Y = data["Y"]
-        self.Z = np.concatenate([Z, np.ones((Z.shape[0], 1))], axis=1)
-        # Dimensions
-        self._M, self._R = self.Z.shape
-        self._N, self._P = self.B.shape
+        """Load and prepare data tensors (Y, B with intercept, Z with intercept).
+
+        Supports two formats:
+          - Multi-group dict: keys are group names, each data[group].item()
+            contains {"X_spatial", "Y", "Z"}.
+          - Legacy flat: data contains "X_spatial", "Y", "Z" directly.
+        """
+        # Detect multi-group dict format (keys are group names wrapping sub-dicts)
+        first_key = list(data.keys())[0]
+        first_val = data[first_key]
+        is_multigroup = (
+            hasattr(first_val, 'item') and first_val.ndim == 0
+            and isinstance(first_val.item(), dict)
+            and "Y" in first_val.item()
+        )
+
+        if is_multigroup:
+            self.group_names = list(data.keys())
+            self.n_group = len(self.group_names)
+
+            # X_spatial is shared — use the first group's
+            first_group = self.group_names[0]
+            B = data[first_group].item()["X_spatial"].astype(np.float64)
+            B = B * 50 / B.shape[0]
+            self.B = np.concatenate([B, np.ones((B.shape[0], 1))], axis=1)
+            self._N, self._P = self.B.shape
+
+            # Per-group data
+            self.Y_dict = {}
+            self.Z_dict = {}
+            self.n_subject = {}
+            for group_name in self.group_names:
+                group_data = data[group_name].item()
+                Y_g = group_data["Y"]
+                Z_g = group_data["Z"]
+                Z_g = Z_g * 50 / Z_g.shape[0]
+                intercept_col = np.ones((Z_g.shape[0], 1))
+                Z_with_intercept = np.concatenate([Z_g, intercept_col], axis=1)
+                self.Y_dict[group_name] = Y_g
+                self.Z_dict[group_name] = Z_with_intercept
+                self.n_subject[group_name] = Z_with_intercept.shape[0]
+
+            # Concatenated arrays for fitting (shared model)
+            self.Z = np.concatenate([self.Z_dict[g] for g in self.group_names], axis=0)
+            self.Y = np.concatenate([self.Y_dict[g] for g in self.group_names], axis=0)
+            self._M, self._R = self.Z.shape
+        else:
+            # Legacy flat format
+            self.group_names = None
+            self.n_group = 1
+            B, Z = data["X_spatial"], data["Z"]
+            B = B.astype(np.float64)
+            B = B * 50 / B.shape[0]
+            Z = Z * 50 / Z.shape[0]
+            self.B = np.concatenate([B, np.ones((B.shape[0], 1))], axis=1)
+            self.Y = data["Y"]
+            self.Z = np.concatenate([Z, np.ones((Z.shape[0], 1))], axis=1)
+            self._M, self._R = self.Z.shape
+            self._N, self._P = self.B.shape
         
     def run_regression(self, 
                        model: str, 
@@ -163,17 +212,36 @@ class BrainRegression_Approximate:
                        nll_mode: int = "dask",
                        block_size: int = 10000, 
                        compute_nll: bool = False):
-        """Fit the regression model and return estimated coefficients."""
+        """Fit the regression model and return estimated coefficients.
+
+        For multi-group SpatialBrainLesion, fits each group independently
+        and returns a dict {group_name: beta_g}.
+        For MassUnivariateRegression, fits on concatenated data (shared beta).
+        """
         start = time.time()
         if model == "SpatialBrainLesion":
-            beta = fit_multiplicative_log_glm(
-                self.Z, self.B, self.Y, tol=tol,
-                max_iter=max_iter, alpha=alpha,
-                gradient_mode=gradient_mode,     
-                preconditioner_mode=preconditioner_mode,
-                nll_mode=nll_mode, block_size=block_size,
-                compute_nll=compute_nll)
+            if self.group_names and self.n_group > 1:
+                # Per-group fitting
+                beta = {}
+                for group_name in self.group_names:
+                    logger.info("Fitting SpatialBrainLesion for group %s", group_name)
+                    beta[group_name] = fit_multiplicative_log_glm(
+                        self.Z_dict[group_name], self.B, self.Y_dict[group_name],
+                        tol=tol, max_iter=max_iter, alpha=alpha,
+                        gradient_mode=gradient_mode,
+                        preconditioner_mode=preconditioner_mode,
+                        nll_mode=nll_mode, block_size=block_size,
+                        compute_nll=compute_nll)
+            else:
+                beta = fit_multiplicative_log_glm(
+                    self.Z, self.B, self.Y, tol=tol,
+                    max_iter=max_iter, alpha=alpha,
+                    gradient_mode=gradient_mode,     
+                    preconditioner_mode=preconditioner_mode,
+                    nll_mode=nll_mode, block_size=block_size,
+                    compute_nll=compute_nll)
         elif model == "MassUnivariateRegression":
+            # Shared beta across groups — fit on concatenated data
             beta = fit_MUM_log_glm(
                 self.Z, self.B, self.Y, marginal_dist, 
                 link_func, tol=tol, 
@@ -186,11 +254,29 @@ class BrainRegression_Approximate:
         return beta
 
     def goodness_of_fit(self, beta, model, mode="dask", block_size=100):
-        """Compute goodness-of-fit statistics (mean/std of MU, mean of P)."""
+        """Compute goodness-of-fit statistics (mean/std of MU, mean of P).
+
+        For multi-group SpatialBrainLesion with per-group beta (dict),
+        returns dicts keyed by group name.
+        """
         if model == "SpatialBrainLesion":
-            MU_mean, MU_std = SpatialGLM_compute_mu_mean(self.Z, self.B, beta, mode=mode, block_size=block_size)
-            P_mean = SpatialGLM_compute_P_mean(self.Z, self.B, beta, mode=mode, block_size=block_size)
-            return MU_mean, MU_std, P_mean
+            if isinstance(beta, dict):
+                MU_mean, MU_std, P_mean = {}, {}, {}
+                for group_name in self.group_names:
+                    mu_m, mu_s = SpatialGLM_compute_mu_mean(
+                        self.Z_dict[group_name], self.B, beta[group_name],
+                        mode=mode, block_size=block_size)
+                    p_m = SpatialGLM_compute_P_mean(
+                        self.Z_dict[group_name], self.B, beta[group_name],
+                        mode=mode, block_size=block_size)
+                    MU_mean[group_name] = mu_m
+                    MU_std[group_name] = mu_s
+                    P_mean[group_name] = p_m
+                return MU_mean, MU_std, P_mean
+            else:
+                MU_mean, MU_std = SpatialGLM_compute_mu_mean(self.Z, self.B, beta, mode=mode, block_size=block_size)
+                P_mean = SpatialGLM_compute_P_mean(self.Z, self.B, beta, mode=mode, block_size=block_size)
+                return MU_mean, MU_std, P_mean
         elif model == "MassUnivariateRegression":
             MU = np.exp(self.Z @ beta)
             P = MU * np.exp(-MU)
