@@ -79,18 +79,42 @@ class BrainInference_full(object):
         self.eta = np.log(self.P_mean)
 
         # beta and spatial dimensions
-        self.beta = torch.tensor(params["beta"], **self._kwargs)
-        self.beta_array = params["beta"]
+        beta_raw = params["beta"]
+        beta_val = beta_raw.item() if beta_raw.ndim == 0 else beta_raw
+        if isinstance(beta_val, dict):
+            # Per-group betas: dict {group_name: (n_bases, n_covariates)}
+            self.beta_dict = {g: torch.tensor(beta_val[g], **self._kwargs) for g in self.group_names}
+            self.beta_array_dict = {g: beta_val[g] for g in self.group_names}
+            # For backward compat, set self.beta / beta_array to first group's
+            first = self.group_names[0]
+            self.beta = self.beta_dict[first]
+            self.beta_array = self.beta_array_dict[first]
+        else:
+            # Single shared beta (single-group or legacy)
+            self.beta = torch.tensor(beta_val, **self._kwargs)
+            self.beta_array = beta_val
+            self.beta_dict = {g: self.beta for g in self.group_names}
+            self.beta_array_dict = {g: self.beta_array for g in self.group_names}
         self.n_voxel, self.n_bases = self.X_spatial.shape
 
     def create_contrast(self, contrast_vector=None, contrast_name=None):
         """Build and normalise the contrast vector over groups."""
         self.contrast_name = contrast_name
-        self.contrast_vector = (
-            np.eye(self.n_group)
-            if contrast_vector is None
-            else np.array(contrast_vector).reshape(1, -1)
-        )
+        if contrast_vector is None:
+            if self.n_group == 1:
+                # Single group: trivial identity contrast (unused in MUM path)
+                self.contrast_vector = np.eye(1)
+            else:
+                # Default: consecutive pairwise differences c_g - c_{g+1}.
+                # For 2 groups this is [[1, -1]], which tests the group difference
+                # rather than each group's absolute effect.
+                c = np.zeros((self.n_group - 1, self.n_group))
+                for k in range(self.n_group - 1):
+                    c[k, k] = 1
+                    c[k, k + 1] = -1
+                self.contrast_vector = c
+        else:
+            self.contrast_vector = np.array(contrast_vector).reshape(1, -1)
         if self.contrast_vector.shape[1] != self.n_group:
             raise ValueError(
                 f"Contrast vector shape {self.contrast_vector.shape} "
@@ -102,19 +126,117 @@ class BrainInference_full(object):
     def run_inference(self, method="FI", inference_filename=None, fig_filename=None, lesion_mask=None, alpha=0.05):
         z_threshold = scipy.stats.norm.ppf(1-alpha)
         if not os.path.exists(inference_filename):
+            print(f"[INFERENCE] Computing fresh inference → {inference_filename}")
             p_vals, z_stats = self._glh_con_group(method)
             np.savez(inference_filename, p_vals=p_vals, z_stats=z_stats)
         else:
+            print(f"[INFERENCE] LOADING CACHED inference from {inference_filename}")
             loaded = np.load(inference_filename)
             p_vals = loaded["p_vals"]
             z_stats = loaded["z_stats"]
+        print(f"[INFERENCE] z_stats: min={z_stats.min():.4f}, max={z_stats.max():.4f}, "
+              f"mean={z_stats.mean():.4f}, std={np.std(z_stats):.4f}")
+        print(f"[INFERENCE] significant (two-sided, alpha=0.05): "
+              f"{np.count_nonzero(2.0 * scipy.stats.norm.sf(np.abs(z_stats)) < 0.05)}/{z_stats.size}")
         logger.info("p_vals shape: %s", p_vals.shape)
         logger.info("Plotting inference results to %s", fig_filename)
-        plot_brain(p=z_stats.ravel(), brain_mask=lesion_mask, threshold=z_threshold, output_filename=fig_filename)
-
+        os.makedirs(os.path.dirname(fig_filename), exist_ok=True)
+        print("threshold", z_threshold)
+        if z_stats.ndim == 2 and z_stats.shape[0] > 1:
+            for i in range(z_stats.shape[0]):
+                suffix = f"_contrast_{i}"
+                out_fname = fig_filename.replace(".png", f"{suffix}.png")
+                plot_brain(p=z_stats[i], brain_mask=lesion_mask, threshold=z_threshold, output_filename=out_fname)
+        else:
+            plot_brain(p=z_stats.ravel(), brain_mask=lesion_mask, threshold=z_threshold, output_filename=fig_filename)
 
     def _glh_con_group(self, method, batch_size=20):
-        """Generalised linear hypothesis test (Wald test).
+        """Dispatch to model-specific inference method."""
+        if self.model == "SpatialBrainLesion":
+            return self._glh_SpatialBrainLesion(method)
+        elif self.model == "MassUnivariateRegression":
+            return self._glh_MassUnivariate()
+        else:
+            raise ValueError(f"Model {self.model} not supported for inference.")
+
+    def _glh_MassUnivariate(self):
+        """Wald test for MassUnivariateRegression (per-voxel beta).
+
+        For each voxel j, beta_j is (n_covariates,) and the per-voxel
+        Fisher information is F_j = Z^T W_j Z where W_j = diag(mu_{ij}).
+        Cov(beta_j) = F_j^{-1}.
+        """
+        # Reconstruct mu per group, stack Z and Y across groups
+        Z_all, Y_all = [], []
+        for group in self.group_names:
+            Z_all.append(self.Z[group].cpu().numpy())
+            Y_all.append(self.Y[group].cpu().numpy())
+        Z_np = np.concatenate(Z_all, axis=0)  # (M_total, n_covariates)
+        Y_np = np.concatenate(Y_all, axis=0)  # (M_total, n_voxels)
+
+        if self.link_func == "log":
+            MU = np.exp(Z_np @ self.beta_array.T)  # (M_total, n_voxels)
+            # FI per voxel: F_j = Z^T diag(mu_j) Z, shape (n_voxels, R, R)
+            FI = np.einsum('im,ij,ik->jmk', Z_np, MU, Z_np)
+        elif self.link_func == "logit":
+            linear = Z_np @ self.beta_array.T
+            MU = 1.0 / (1.0 + np.exp(-linear))
+            FI = np.einsum('im,ij,ik->jmk', Z_np, MU * (1.0 - MU), Z_np)
+        else:
+            raise ValueError(f"Link function {self.link_func} not supported.")
+
+        Cov_beta = np.linalg.pinv(FI)  # (n_voxels, R, R)
+
+        # Numerator: contrast @ beta_j for each voxel
+        # beta_array: (n_voxels, n_covariates), contrast_vector: (n_contrast, n_group)
+        # For homogeneity test, contrast_vector is eye(1) = [[1]], so this is beta[:, 0]
+        # For general tests, we need contrast over covariates — use the non-intercept sum
+        n_cov = self.beta_array.shape[1]
+
+        if self.n_group == 1:
+            # Homogeneity: test non-intercept covariates
+            contrast_beta = np.sum(self.beta_array[:, :n_cov - 1], axis=1)  # (n_voxels,)
+            # Variance: sum of Cov(beta_s, beta_s) for non-intercept s
+            var_beta = np.zeros(self.n_voxel)
+            for s in range(n_cov - 1):
+                var_beta += Cov_beta[:, s, s]
+                # Add cross-covariance terms
+                for t in range(s + 1, n_cov - 1):
+                    var_beta += 2.0 * Cov_beta[:, s, t]
+        else:
+            # Group comparison for MUM with shared beta.
+            # Per-group predicted mean at voxel j: eta_g(j) = bar_Z_g @ beta_j
+            # Contrast: sum_g c_g * eta_g(j) = (sum_g c_g * bar_Z_g) @ beta_j = delta_Z @ beta_j
+            # Under null (same generative process): bar_Z_1 ≈ bar_Z_2, so delta_Z ≈ 0.
+            bar_Z_per_group = []
+            for group in self.group_names:
+                bar_Z_per_group.append(self.Z[group].cpu().numpy().mean(axis=0))  # (n_cov,)
+            bar_Z_stack = np.stack(bar_Z_per_group, axis=0)  # (n_group, n_cov)
+            # delta_Z = contrast_vector @ bar_Z_stack → (n_contrast, n_cov)
+            delta_Z = self.contrast_vector @ bar_Z_stack  # (n_contrast, n_cov)
+            # Numerator: delta_Z @ beta_j for each voxel j
+            # beta_array: (n_voxels, n_cov), delta_Z: (n_contrast, n_cov)
+            contrast_beta = delta_Z @ self.beta_array.T  # (n_contrast, n_voxels)
+            # Variance: delta_Z @ Cov(beta_j) @ delta_Z^T for each voxel
+            # Cov_beta: (n_voxels, n_cov, n_cov)
+            var_beta = np.einsum(
+                'ck,jkl,cl->cj', delta_Z, Cov_beta, delta_Z
+            )  # (n_contrast, n_voxels)
+
+        contrast_std = np.sqrt(np.maximum(var_beta, 0.0))
+
+        z_stats = contrast_beta / np.where(contrast_std > 0, contrast_std, np.inf)
+        # Two-sided p-value: 2 * P(Z > |z|)
+        p_vals = 2.0 * scipy.stats.norm.sf(np.abs(z_stats))  # shape: (n_contrast, n_voxels)
+        logger.info(
+            "MUM p-values: min=%.4g, max=%.4g, significant=%d, shape=%s",
+            np.min(p_vals), np.max(p_vals),
+            np.count_nonzero(p_vals < 0.05), p_vals.shape,
+        )
+        return p_vals, z_stats
+
+    def _glh_SpatialBrainLesion(self, method):
+        """Wald test for SpatialBrainLesion (shared spatial-bases beta).
 
         Single-group (spatial homogeneity): tests whether non-intercept
         covariates (e.g. age) have a non-zero voxel-wise spatial effect
@@ -127,42 +249,32 @@ class BrainInference_full(object):
         for group in self.group_names:
             all_bar_Z[group] = self.Z[group].mean(dim=0).cpu().numpy()  # (n_covariates,)
 
-        n_subject_list = list(self.n_subject.values())
-
-        # --- Per-covariate contribution to mean linear predictor ---
-        # bar_eta_{gs,j} = bar_Z_{gs} * X_j @ beta_s
-        all_eta_per_cov = {}
-        for group in self.group_names:
-            n_cov = self.n_covariates[group]
-            eta_per_cov = []
-            for s in range(n_cov):
-                eta_s = all_bar_Z[group][s] * (self.X_spatial_array @ self.beta_array[:, s])
-                eta_per_cov.append(eta_s)  # (n_voxel,)
-            all_eta_per_cov[group] = eta_per_cov
-
         # --- Numerator of Wald test ---
         if self.n_group == 1:
-            # Spatial homogeneity: test whether non-intercept coefficients
-            # (e.g. age) have a non-zero spatial effect.
-            # H0: X @ beta_s = 0 for each non-intercept covariate s.
-            # bar_Z is NOT used here — we test the coefficient itself,
-            # not the linear predictor evaluated at the mean covariate.
             group = self.group_names[0]
             n_cov = self.n_covariates[group]
-            # Each non-intercept covariate contributes X @ beta_s
+            beta_g = self.beta_array_dict[group]
             contrast_eta = np.sum(
-                [self.X_spatial_array @ self.beta_array[:, s] for s in range(n_cov - 1)],
+                [self.X_spatial_array @ beta_g[:, s] for s in range(n_cov - 1)],
                 axis=0,
             ).reshape(1, -1)  # (1, n_voxel)
             logger.info(
                 "Homogeneity test: numerator from %d non-intercept covariates", n_cov - 1
             )
         else:
-            # Group comparison: contrast across group-level mean linear predictors.
-            # For a zero-sum contrast the shared intercept cancels automatically.
+            all_eta_per_cov = {}
+            for group in self.group_names:
+                n_cov = self.n_covariates[group]
+                beta_g = self.beta_array_dict[group]
+                eta_per_cov = []
+                for s in range(n_cov):
+                    eta_s = all_bar_Z[group][s] * (self.X_spatial_array @ beta_g[:, s])
+                    eta_per_cov.append(eta_s)
+                all_eta_per_cov[group] = eta_per_cov
             group_eta = np.stack([
                 np.sum(all_eta_per_cov[g], axis=0) for g in self.group_names
             ], axis=0)  # (n_group, n_voxel)
+
             contrast_eta = self.contrast_vector @ group_eta  # (n_contrast, n_voxel)
             logger.info("Group comparison: contrast_eta shape %s", contrast_eta.shape)
 
@@ -171,10 +283,12 @@ class BrainInference_full(object):
             all_F_beta = self._Fisher_info()
             all_cov_beta = {}
             for group in self.group_names:
-                F_beta = all_F_beta[group]
-                cov_beta = [np.linalg.inv(F_beta[:, i, :, i] + 1e-6 * np.eye(self.n_bases))
-                            for i in range(self.n_covariates[group])]
-                all_cov_beta[group] = cov_beta
+                F_beta = all_F_beta[group]  # shape (P, R, P, R) from autograd Hessian
+                n_cov = self.n_covariates[group]
+                P_dim = self.n_bases
+                # Reorder to (R*P, R*P): F[p1,r1,p2,r2] -> full[r1*P+p1, r2*P+p2]
+                F_full = F_beta.transpose(1, 0, 3, 2).reshape(n_cov * P_dim, n_cov * P_dim)
+                all_cov_beta[group] = np.linalg.inv(F_full + 1e-6 * np.eye(n_cov * P_dim))
                 del F_beta
             del all_F_beta
         elif method == "sandwich":
@@ -182,73 +296,87 @@ class BrainInference_full(object):
             for group in self.group_names:
                 Z_np = self.Z[group].cpu().numpy()
                 Y_np = self.Y[group].cpu().numpy()
-                g_idx = self.group_names.index(group)
-                # Reconstruct per-subject mu from eta; mu = exp(Z @ beta^T @ X^T)
-                mu_group = np.exp(Z_np @ self.beta_array.T @ self.X_spatial_array.T)  # (M, N)
+                beta_g = self.beta_array_dict[group]
+                mu_group = np.exp(Z_np @ beta_g.T @ self.X_spatial_array.T)  # (M, N)
                 n_cov = self.n_covariates[group]
-                P = self.n_bases  # number of spatial bases
+                P = self.n_bases
                 start_time = time.time()
+                if self.marginal_dist == "NB":
+                    r_nb = 1.0  # dispersion, matching model.py
+                    bread_w = r_nb * mu_group / (r_nb + mu_group)
+                    score_r = r_nb * (Y_np - mu_group) / (r_nb + mu_group)
+                elif self.marginal_dist == "Poisson":
+                    bread_w = mu_group
+                    score_r = Y_np - mu_group
+                else:
+                    raise ValueError(f"Sandwich not implemented for {self.marginal_dist}")
                 cov_full = self.poisson_sandwich_kron(
-                    Z_np, self.X_spatial_array, Y_np, mu_group, meat="cluster"
-                )  # (R*P, R*P)
+                    Z_np, self.X_spatial_array, Y_np, mu_group, meat="cluster",
+                    bread_weights=bread_w, score_residuals=score_r,
+                )
                 logger.info("Sandwich cov for group %s computed in %.1fs", group, time.time() - start_time)
-                # Extract diagonal blocks: cov_beta[s] = cov_full[s*P:(s+1)*P, s*P:(s+1)*P]
-                all_cov_beta[group] = [
-                    cov_full[s * P:(s + 1) * P, s * P:(s + 1) * P]
-                    for s in range(n_cov)
-                ]
-                del Z_np, Y_np, mu_group, cov_full
-        print("Variance of beta computed")
+                all_cov_beta[group] = cov_full  # full (R*P, R*P) covariance
+                del Z_np, Y_np, mu_group
+        logger.info("Variance of beta computed")
 
         # --- Variance of the test statistic ---
+        # Uses the FULL covariance (including cross-covariate blocks):
+        #   Var(bar_eta_{g,j}) = sum_s sum_t  bar_z_s * bar_z_t * x_j^T Cov_st x_j
+        P_dim = self.n_bases
         if self.n_group == 1:
-            # Homogeneity: variance from non-intercept covariates only.
-            # Var(X @ beta_s) = X @ Cov(beta_s) @ X^T  (no bar_Z factor)
             group = self.group_names[0]
             n_cov = self.n_covariates[group]
             var_total = np.zeros(self.n_voxel)
-            for s in range(n_cov - 1):  # exclude intercept (last column)
-                start_time = time.time()
-                var_s = np.einsum(
-                    'ij,jk,ik->i', self.X_spatial_array,
-                    all_cov_beta[group][s], self.X_spatial_array
-                )
-                var_total += var_s
-                print(f"Variance for covariate {s} in {group}: {time.time() - start_time:.2f}s")
+            for s in range(n_cov - 1):
+                for t in range(n_cov - 1):
+                    Cov_st = all_cov_beta[group][s * P_dim:(s + 1) * P_dim,
+                                                  t * P_dim:(t + 1) * P_dim]
+                    var_total += np.einsum(
+                        'ij,jk,ik->i', self.X_spatial_array,
+                        Cov_st, self.X_spatial_array
+                    )
             del all_cov_beta
-            contrast_var_bar_eta = var_total.reshape(1, -1)  # (1, n_voxel)
+            contrast_var_bar_eta = var_total.reshape(1, -1)
         else:
-            # Group comparison: variance from all covariates per group, then contrast
             all_var_bar_eta = {}
             for group in self.group_names:
-                var_bar_eta = []
-                for s in range(self.n_covariates[group]):
-                    start_time = time.time()
-                    var_s = all_bar_Z[group][s] * np.einsum(
-                        'ij,jk,ik->i', self.X_spatial_array,
-                        all_cov_beta[group][s], self.X_spatial_array
-                    )
-                    print(f"Variance for cov {s} in {group}: {time.time() - start_time:.2f}s")
-                    var_bar_eta.append(var_s)
-                var_bar_eta = np.stack(var_bar_eta, axis=0)  # (n_cov, n_voxel)
-                all_var_bar_eta[group] = var_bar_eta
+                n_cov = self.n_covariates[group]
+                bar_z = all_bar_Z[group]
+                var_g = np.zeros(self.n_voxel)
+                for s in range(n_cov):
+                    for t in range(n_cov):
+                        Cov_st = all_cov_beta[group][s * P_dim:(s + 1) * P_dim,
+                                                      t * P_dim:(t + 1) * P_dim]
+                        var_g += bar_z[s] * bar_z[t] * np.einsum(
+                            'ij,jk,ik->i', self.X_spatial_array,
+                            Cov_st, self.X_spatial_array
+                        )
+                    logger.info("Variance for cov %d in %s", s, group)
+                all_var_bar_eta[group] = var_g
             del all_cov_beta
-            a = np.concatenate([
-                np.sum(all_var_bar_eta[group], axis=0).reshape(1, -1)
+            a = np.stack([
+                all_var_bar_eta[group].reshape(1, -1)
                 for group in self.group_names
-            ], axis=0)  # (n_group, n_voxel)
+            ], axis=0).squeeze(1)  # (n_group, n_voxel)
             logger.info("Aggregated variance shape: %s", a.shape)
-            contrast_var_bar_eta = self.contrast_vector ** 2 @ a  # (n_contrast, n_voxel)
+            contrast_var_bar_eta = self.contrast_vector ** 2 @ a
 
         contrast_std_bar_eta = np.sqrt(contrast_var_bar_eta)
-        # Conduct Wald test (two-sided Z test)
-        z_stats = contrast_eta / contrast_std_bar_eta  # (n_contrast, n_voxel)
-        p_vals = 2.0 * scipy.stats.norm.sf(np.abs(z_stats))  # two-sided p-values
+        z_stats = contrast_eta / contrast_std_bar_eta
+        if self.n_group == 1:
+            z_stats = z_stats.copy()
+        else:
+            # concatenate z-stats and -z-stats for two-sided test
+            z_stats = np.concatenate([z_stats, -z_stats], axis=0)  # (2*n_contrast, n_voxel)
+        p_vals = scipy.stats.norm.sf(z_stats)  # one-sided p-value for positive effect
         logger.info(
-            "p-values: min=%.4g, max=%.4g, significant=%d, shape=%s",
+            "SGLM p-values: min=%.4g, max=%.4g, significant=%d, shape=%s",
             np.min(p_vals), np.max(p_vals),
             np.count_nonzero(p_vals < 0.05), p_vals.shape,
         )
+        print("SGLM p-values: min=%.4g, max=%.4g, significant=%d, shape=%s",
+            np.min(p_vals), np.max(p_vals),
+            np.count_nonzero(p_vals < 0.05), p_vals.shape,)
         return p_vals, z_stats
     
     def _Fisher_info(self):
@@ -267,10 +395,11 @@ class BrainInference_full(object):
             all_H = {}
             for group in self.group_names:
                 if self.model == "SpatialBrainLesion":
+                    beta_g = self.beta_dict[group]
                     nll = lambda beta, g=group: SpatialBrainLesionModel._neg_log_likelihood(
                         self.marginal_dist, self.link_func, self.regression_terms,
                         self.X_spatial, self.Y[g], self.Z[g], beta, self.device)
-                    H = torch.autograd.functional.hessian(nll, self.beta, create_graph=False)
+                    H = torch.autograd.functional.hessian(nll, beta_g, create_graph=False)
                 elif self.model == "MassUnivariateRegression":
                     beta_age = self.beta[:, 2]
                     beta_other = self.beta.clone()
@@ -284,8 +413,9 @@ class BrainInference_full(object):
             np.savez(Fisher_info_filename, **all_H)
         return all_H
 
-    def poisson_sandwich_kron(self, Z, B, y, mu, *, meat="cluster", ridge=0.0):
-        """Memory-efficient sandwich covariance for Poisson log-link GLM.
+    def poisson_sandwich_kron(self, Z, B, y, mu, *, meat="cluster", ridge=0.0,
+                               bread_weights=None, score_residuals=None):
+        """Memory-efficient sandwich covariance for GLM with log link.
 
         Exploits X[i,j,:] = kron(Z[i,:], B[j,:]) without materialising
         the full design matrix.
@@ -298,6 +428,12 @@ class BrainInference_full(object):
         mu : (M, N) fitted mean (must be > 0)
         meat : 'cluster' or 'iid'
         ridge : ridge penalty added to bread
+        bread_weights : (M, N) or None
+            Custom weights for the bread (Fisher info).  Defaults to mu
+            (Poisson).  For NB: r*mu/(r+mu).
+        score_residuals : (M, N) or None
+            Custom score contributions for the meat.  Defaults to y - mu
+            (Poisson).  For NB: r*(y-mu)/(r+mu).
 
         Returns
         -------
@@ -312,10 +448,15 @@ class BrainInference_full(object):
         N, P = B.shape
         p = R * P
 
-        r = y - mu  # (M, N)
+        if bread_weights is None:
+            bread_weights = mu  # Poisson default
+        if score_residuals is None:
+            score_residuals = y - mu  # Poisson default
+
+        r = score_residuals  # (M, N)
 
         # Bread: A (p x p)
-        w_bread = np.einsum('ik,il,ij->klj', Z, Z, mu)  # (R, R, N)
+        w_bread = np.einsum('ik,il,ij->klj', Z, Z, bread_weights)  # (R, R, N)
         A = np.zeros((p, p))
         for k in range(R):
             for k2 in range(k, R):
@@ -450,108 +591,247 @@ class BrainInference_Approximate(object):
         self.device = device
     
     def load_params(self, data, params):
-        # load X_spatial, G, P, Y
-        self.G = data["G"].item()
-        # group names
-        self.group_names = list(self.G.keys())
-        self.n_subject_per_group = [len(self.G[group]) for group in self.group_names]
-        self.n_group = len(self.group_names)
-        # load P, Y, Z
-        self.B = np.concatenate([data["X_spatial"], np.ones((data["X_spatial"].shape[0], 1))], axis=1)
-        self.Z = np.concatenate([data["Z"], np.ones((data["Z"].shape[0], 1))], axis=1)
+        # Support both legacy flat format and multi-group object-array format.
+        first_key = list(data.keys())[0]
+        first_val = data[first_key]
+        is_multigroup = (
+            hasattr(first_val, "ndim")
+            and first_val.ndim == 0
+            and hasattr(first_val, "item")
+            and isinstance(first_val.item(), dict)
+            and "Y" in first_val.item()
+            and "Z" in first_val.item()
+            and "X_spatial" in first_val.item()
+        )
+
+        if is_multigroup:
+            self.group_names = list(data.keys())
+            self.n_group = len(self.group_names)
+            self.n_subject = {}
+
+            first_group = self.group_names[0]
+            X_spatial = data[first_group].item()["X_spatial"]
+            B_scaled = X_spatial * 50 / X_spatial.shape[0]
+            self.B = np.concatenate([B_scaled, np.ones((B_scaled.shape[0], 1))], axis=1)
+
+            Y_all, Z_all = [], []
+            for group_name in self.group_names:
+                group_data = data[group_name].item()
+                Y_g = group_data["Y"]
+                Z_g = group_data["Z"]
+                self.n_subject[group_name] = Y_g.shape[0]
+                Y_all.append(Y_g)
+                Z_all.append(Z_g)
+
+            Z_cat = np.concatenate(Z_all, axis=0)
+            Z_scaled = Z_cat * 50 / Z_cat.shape[0]
+            self.Z = np.concatenate([Z_scaled, np.ones((Z_scaled.shape[0], 1))], axis=1)
+            self.Y = np.concatenate(Y_all, axis=0)
+        else:
+            self.group_names = ["Group_1"]
+            self.n_group = 1
+            self.n_subject = {"Group_1": data["Y"].shape[0]}
+            B_raw = data["X_spatial"]
+            B_scaled = B_raw * 50 / B_raw.shape[0]
+            self.B = np.concatenate([B_scaled, np.ones((B_scaled.shape[0], 1))], axis=1)
+            Z_raw = data["Z"]
+            Z_scaled = Z_raw * 50 / Z_raw.shape[0]
+            self.Z = np.concatenate([Z_scaled, np.ones((Z_scaled.shape[0], 1))], axis=1)
+            self.Y = data["Y"]
+
         self._M, self._R = self.Z.shape
         self._N, self._P = self.B.shape
         # Load parameters and re-scale
-        self.beta = params["beta"]
+        beta_raw = params["beta"]
+        self.beta = beta_raw.item() if getattr(beta_raw, "ndim", 1) == 0 else beta_raw
+        if isinstance(self.beta, dict):
+            raise NotImplementedError(
+                "BrainInference_Approximate does not support per-group beta dict. "
+                "Use full-model inference or provide a shared beta array."
+            )
         # self.MU = compute_mu(self.rescaled_Z, self.rescaled_B, self.beta, mode="dask", block_size=1000) # shape: (n_subject*n_voxel, 1)
         self.MU = compute_mu(self.Z, self.B, self.beta, mode="dask", block_size=1000) # shape: (n_subject*n_voxel, 1)
-        self.Y = data["Y"] # shape: (n_subject, n_voxel)
         self.Y_reshape = self.Y.reshape(-1, 1) # shape: (n_subject*n_voxel, 1)
     
-    def create_contrast(self, contrast_vector=None, contrast_name=None):
+    def create_contrast(self, contrast_vector=None, contrast_name=None, polynomial_order=None):
         self.contrast_vector = contrast_vector
         self.contrast_name = contrast_name
         # Preprocess the contrast vector
-        self.contrast_vector = (
-            np.eye(self.n_group)
-            if contrast_vector is None
-            else np.array(contrast_vector).reshape(1, -1)
-        )
-        # raise error if dimension of contrast vector doesn't match with number of groups
+        if contrast_vector is None:
+            # Default: test the first non-intercept covariate (e.g. age).
+            # Z columns are [cov_0 (age), ..., cov_{R-2}, intercept].
+            # Contrast [1, 0, ..., 0] tests only the first covariate.
+            c = np.zeros((1, self._R))
+            c[0, 0] = 1
+            self.contrast_vector = c
+        else:
+            self.contrast_vector = np.array(contrast_vector).reshape(1, -1)
+        # raise error if dimension of contrast vector doesn't match
         if self.contrast_vector.shape[1] != self._R:
             raise ValueError(
                 f"""The shape of contrast vector: {str(self.contrast_vector)}
-                doesn't match with number of groups."""
+                doesn't match with number of covariates (_R={self._R})."""
             )
         # standardization (row sum 1)
         self.contrast_vector = self.contrast_vector / np.sum(np.abs(self.contrast_vector), axis=1).reshape((-1, 1))
         
-    def run_inference(self, method="FI", fig_filename=None):
+    def run_inference(self, method="FI", inference_filename=None, fig_filename=None):
         # Generalised linear hypothesis testing
-        p_vals = self._glh_con_group(method)
+        p_vals, z_stats = self._glh_con_group(method)
+        # Save results if filename given
+        if inference_filename is not None:
+            os.makedirs(os.path.dirname(inference_filename), exist_ok=True)
+            np.savez(inference_filename, p_vals=p_vals, z_stats=z_stats)
         # Plot the estimated P, standard error of P, and p-values
-        print(fig_filename)
         if fig_filename is not None:
             self.plot_1d(p_vals, fig_filename, 0.05)
 
     def _glh_con_group(self, method, use_dask=True, batch_size=20):
-        bar_Z = np.mean(self.Z, axis=0) # shape: (n_covariates,)
-        # scale the contrast vector by the group size
-        bar_Z_reshape = bar_Z.reshape(1, -1)
-        group_n_subjects = bar_Z_reshape[:, -self.n_group-1:-1]
-        group_ratio = group_n_subjects / np.max(group_n_subjects)
-        self.contrast_vector[:, -self.n_group-1:-1] /= group_ratio
-        # bar_eta_covariates
+        # Compute the per-covariate spatial effect maps: beta_map[s, j] = B[j,:] @ beta_reshape[:,s]
+        # This directly tests H0: contrast @ beta_map[:, j] = 0 at each voxel j,
+        # which is the correct null for "does covariate s have a spatially-varying effect?".
+        # We do NOT weight by bar_Z because the age covariate is standardized (mean=0),
+        # which would make bar_Z-weighted numerators identically zero.
         beta_reshape = self.beta.reshape(self._P, self._R, order="F")
-        # bar_eta_covariates = (self.B @ beta_reshape).T * bar_Z[:,np.newaxis] # shape: (n_covariates, n_voxel)
-        bar_eta_covariates = (bar_Z * beta_reshape).T @ self.B.T # shape: (n_covariates, n_voxel)
-        contrast_eta_covariates = self.contrast_vector @ bar_eta_covariates # shape: (1, n_voxel)
-        print(np.min(contrast_eta_covariates), np.max(contrast_eta_covariates))
-        del bar_eta_covariates
-        # Estimate the variance of beta, from either FI or sandwich estimator
+        # beta_map: (n_covariates, n_voxel)  =  (beta_reshape.T @ B.T)
+        beta_map = beta_reshape.T @ self.B.T                           # (R, N)
+        contrast_eta_covariates = self.contrast_vector @ beta_map      # (S, N)
+        logger.info("contrast_eta range: %.4g .. %.4g", contrast_eta_covariates.min(), contrast_eta_covariates.max())
+        # Estimate the covariance of beta, from either FI or sandwich estimator
         start_time = time.time()
         if method == "FI":
-            F_beta = efficient_kronT_diag_kron(self.Z, self.B, self.MU, use_dask=use_dask, block_size=1e4) # shape: (n_covariates*n_bases, n_covariates*n_bases)
+            F_beta = efficient_kronT_diag_kron(self.Z, self.B, self.MU, use_dask=use_dask, block_size=1e4) # shape: (R*P, R*P)
             cov_beta = [robust_inverse(F_beta[i*self._P:(i+1)*self._P, i*self._P:(i+1)*self._P]+1e-6*np.eye(self._P)) for i in range(self._R)]
             del F_beta
-            print(f"Time taken for Fisher Information: {time.time() - start_time}")
+            logger.info("Fisher Information computed in %.1fs", time.time() - start_time)
         elif method == "sandwich":
-            bread_term = self.bread_term(self.Z, self.B, self.MU) # list: len = n_covariates
-            meat_term = self.meat_term(self.Z, self.B, self.MU, self.Y_reshape) # list: len = n_covariates
-            # # sandwich estimator
-            cov_beta = [B @ M @ B for B, M in zip(bread_term, meat_term)]
-            print(len(cov_beta))
-            print(np.min(np.diag(cov_beta[1])), np.mean(np.diag(cov_beta[1])), np.max(np.diag(cov_beta[1])))
-            print(np.min(np.diag(cov_beta[2])), np.mean(np.diag(cov_beta[2])), np.max(np.diag(cov_beta[2])))
-            print("====================================")
-            del bread_term, meat_term
-            print(f"Time taken for sandwich estimator: {time.time() - start_time}")
-        print("Variance of beta computed")
-        var_bar_eta = list()
-        for s in range(self._R):
-            # for covariate s, at voxel j
-            # bar_eta_sj = bar_Z_s * X_j^T @ beta_s -- dim: (1,)
-            # COV(bar_eta_sj) = bar_Z_s * X_j^T @ COV(beta_s) @ X_j -- dim: (1,)
-            # COV(bar_eta_s) = bar_Z_s**2 * X @ COV(beta_s) @ X^T -- dim: (n_voxel, n_voxel)
-            var_bar_eta_s = bar_Z[s] * np.einsum('ij,jk,ik->i', self.B, cov_beta[s], self.B) # shape: (n_voxel,)
-            var_bar_eta.append(var_bar_eta_s)
-            del var_bar_eta_s
-        var_bar_eta = np.stack(var_bar_eta, axis=0) # shape: (n_covariate, n_voxel)
-        print(np.min(var_bar_eta[1]), np.mean(var_bar_eta[1]), np.max(var_bar_eta[1]))
-        print(np.min(var_bar_eta[2]), np.mean(var_bar_eta[2]), np.max(var_bar_eta[2]))
-        del cov_beta
-        gc.collect()
-        # Compute the numerator of the Z test
-        contrast_var_bar_eta = self.contrast_vector**2 @ var_bar_eta # shape: (1, n_voxel)
-        contrast_std_bar_eta = np.sqrt(contrast_var_bar_eta) # shape: (1, n_voxel)
-        # Conduct Wald test (Z test)
-        z_stats_eta = contrast_eta_covariates / contrast_std_bar_eta
-        print(np.min(z_stats_eta), np.max(z_stats_eta))
-        z_stats = np.concatenate([z_stats_eta, -z_stats_eta], axis=0) # shape: (2, n_voxel)
-        p_vals = scipy.stats.norm.sf(z_stats) # shape: (2, n_voxel)
-        print(np.min(p_vals), np.mean(p_vals), np.max(p_vals))
-        exit()
-        return p_vals
+            MU_matrix = self.MU.reshape(self._M, self._N)
+            cov_beta_full = self.poisson_sandwich_kron(
+                self.Z, self.B, self.Y, MU_matrix, meat="cluster", ridge=0.0
+            )  # (R*P, R*P)
+            logger.info("Sandwich estimator computed in %.1fs", time.time() - start_time)
+
+        if method == "FI":
+            # Var(c[s] * B_j @ beta_s) = c[s]^2 * B_j^T Cov(beta_s) B_j  (block-diagonal approx)
+            var_eta = list()
+            for s in range(self._R):
+                var_eta_s = np.einsum('ij,jk,ik->i', self.B, cov_beta[s], self.B) # (n_voxel,)
+                var_eta.append(var_eta_s)
+            var_eta = np.stack(var_eta, axis=0) # (R, N)
+            del cov_beta
+            gc.collect()
+            contrast_var_bar_eta = self.contrast_vector**2 @ var_eta # (S, N)
+        else:
+            # Full sandwich variance: Var(c @ beta_map_j) = (c ⊗ B_j)^T Cov(beta) (c ⊗ B_j)
+            # where c is the contrast over covariates (no bar_Z weighting)
+            CB = np.einsum('ij,kl->ikjl', self.contrast_vector, self.B)  # (S, N, R, P)
+            CB_flat = CB.reshape(self.contrast_vector.shape[0], self._N, -1)  # (S, N, R*P)
+            tmp = np.einsum('snk,kl->snl', CB_flat, cov_beta_full)           # (S, N, R*P)
+            contrast_var_bar_eta = np.sum(tmp * CB_flat, axis=-1)             # (S, N)
+
+        contrast_std_bar_eta = np.sqrt(np.maximum(contrast_var_bar_eta, 0.0)) # (S, N)
+        # Two-sided Wald test
+        z_stats = contrast_eta_covariates / np.where(contrast_std_bar_eta > 0, contrast_std_bar_eta, np.inf)
+        p_vals = 2.0 * scipy.stats.norm.sf(np.abs(z_stats))  # two-sided p-value
+        logger.info(
+            "SGLM p-values: min=%.4g, max=%.4g, significant=%d/%d, shape=%s",
+            np.min(p_vals), np.max(p_vals),
+            np.count_nonzero(p_vals < 0.05), p_vals.size, p_vals.shape,
+        )
+        return p_vals, z_stats
+
+    def poisson_sandwich_kron(self,
+                                Z,
+                                B,
+                                y,
+                                mu,
+                                *,
+                                meat="cluster",
+                                ridge=0.0):
+        """Memory-efficient sandwich covariance for Poisson log-link GLM.
+
+        This mirrors the UKB implementation and avoids materializing the
+        full Kronecker design matrix.
+        """
+        Z  = np.asarray(Z,  dtype=float)
+        B  = np.asarray(B,  dtype=float)
+        y  = np.asarray(y,  dtype=float)
+        mu = np.asarray(mu, dtype=float)
+
+        M, R = Z.shape
+        N, P = B.shape
+        p = R * P
+
+        if y.shape != (M, N) or mu.shape != (M, N):
+            raise ValueError("y and mu must have shape (M, N) matching Z and B.")
+        if not np.isfinite(Z).all() or not np.isfinite(B).all() or not np.isfinite(y).all():
+            raise ValueError("Inputs Z/B/y contain NaN or Inf.")
+
+        # Stabilize fitted means to prevent NaN/Inf propagation.
+        mu = np.nan_to_num(mu, nan=0.0, posinf=1e12, neginf=0.0)
+        mu = np.clip(mu, 1e-12, 1e12)
+
+        r = np.nan_to_num(y - mu, nan=0.0, posinf=0.0, neginf=0.0)
+
+        w_bread = np.einsum('ik,il,ij->klj', Z, Z, mu)
+        A = np.zeros((p, p))
+        for k in range(R):
+            for k2 in range(k, R):
+                block = B.T @ (B * w_bread[k, k2, :, None])
+                A[k*P:(k+1)*P, k2*P:(k2+1)*P] = block
+                if k != k2:
+                    A[k2*P:(k2+1)*P, k*P:(k+1)*P] = block
+
+        if ridge > 0:
+            A += ridge * np.eye(p)
+
+        # Ensure numeric validity/symmetry before factorization.
+        A = np.nan_to_num(A, nan=0.0, posinf=1e12, neginf=-1e12)
+        A = 0.5 * (A + A.T)
+
+        meat_kind = meat.lower()
+        if meat_kind == "cluster":
+            Bt_r = B.T @ r.T
+            U = np.zeros((p, M))
+            for k in range(R):
+                U[k*P:(k+1)*P, :] = Bt_r * Z[:, k][None, :]
+            C = U
+            Bmeat = None
+        elif meat_kind == "iid":
+            w_meat = np.einsum('ik,il,ij->klj', Z, Z, r**2)
+            Bmeat = np.zeros((p, p))
+            for k in range(R):
+                for k2 in range(k, R):
+                    block = B.T @ (B * w_meat[k, k2, :, None])
+                    Bmeat[k*P:(k+1)*P, k2*P:(k2+1)*P] = block
+                    if k != k2:
+                        Bmeat[k2*P:(k2+1)*P, k*P:(k+1)*P] = block
+            C = None
+        else:
+            raise ValueError("meat must be 'iid' or 'cluster'.")
+
+        try:
+            ridge_eps = max(ridge, 1e-8)
+            L, low = scipy.linalg.cho_factor(A + ridge_eps * np.eye(p))
+            if meat_kind == "cluster":
+                Y = scipy.linalg.cho_solve((L, low), C)
+                cov = Y @ Y.T
+            else:
+                D   = scipy.linalg.cho_solve((L, low), Bmeat)
+                cov = scipy.linalg.cho_solve((L, low), D.T).T
+        except (np.linalg.LinAlgError, ValueError):
+            print("Cholesky failed (or non-finite matrix) — falling back to pseudo-inverse")
+            A_safe = np.nan_to_num(A, nan=0.0, posinf=1e12, neginf=-1e12)
+            Ainv = np.linalg.pinv(A_safe + 1e-6 * np.eye(p))
+            if meat_kind == "cluster":
+                Y = Ainv @ C
+                cov = Y @ Y.T
+            else:
+                Bmeat_safe = np.nan_to_num(Bmeat, nan=0.0, posinf=1e12, neginf=-1e12)
+                cov = Ainv @ Bmeat_safe @ Ainv
+
+        cov = 0.5 * (cov + cov.T)
+        return cov
     
     def bread_term(self, Z, B, P, use_dask=True, block_size=1000):
         XTWX = efficient_kronT_diag_kron(Z, B, P, use_dask=use_dask, block_size=block_size) # shape: (n_covariates*n_bases, n_covariates*n_bases)
