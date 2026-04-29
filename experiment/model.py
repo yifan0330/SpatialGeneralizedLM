@@ -16,6 +16,7 @@ class SpatialBrainLesionModel(nn.Module):
                  link_func: str = "logit",
                  marginal_dist: str = "Bernoulli",
                  regression_terms: List[str] = ["multiplicative", "additive"],
+                 group_names: list = None,
                  device: str = "cpu",
                  dtype = torch.float32):
         """ Spatial brain lesion model
@@ -57,8 +58,23 @@ class SpatialBrainLesionModel(nn.Module):
         self.dtype = dtype
         self._kwargs = {"device": self.device, "dtype": self.dtype}
         # regression coefficients for covariates
-        self.beta = nn.Parameter(torch.randn(n_bases, self.n_covariates, **self._kwargs) * self.std_params)
+        # Per-group betas for multi-group; single shared beta otherwise
+        self.group_names = group_names
+        if group_names is not None and len(group_names) > 1:
+            self.betas = nn.ParameterDict({
+                g: nn.Parameter(torch.randn(n_bases, self.n_covariates, **self._kwargs) * self.std_params)
+                for g in group_names
+            })
+            self.beta = None  # not used directly
+        else:
+            self.beta = nn.Parameter(torch.randn(n_bases, self.n_covariates, **self._kwargs) * self.std_params)
+            self.betas = None
 
+    def _get_beta(self, group_name=None):
+        """Return beta for a specific group, or the shared beta."""
+        if self.betas is not None and group_name is not None:
+            return self.betas[group_name]
+        return self.beta
 
     def forward(self, X, Y, Z):
         """Compute predicted probabilities for each group.
@@ -76,8 +92,9 @@ class SpatialBrainLesionModel(nn.Module):
         if isinstance(Z, dict):
             P = {}
             for group_name in Z:
+                beta_g = self._get_beta(group_name)
                 P[group_name] = self.inverse_link_func(
-                    Z[group_name] @ self.beta.T @ X[group_name].T
+                    Z[group_name] @ beta_g.T @ X[group_name].T
                 )
             return P
         # Single-group backward compatibility
@@ -98,6 +115,11 @@ class SpatialBrainLesionModel(nn.Module):
             nll = -(torch.log(P) * Y + torch.log(1 - P) * (1 - Y)).mean()
         elif self.marginal_dist == "Poisson":
             nll = -(Y * torch.log(P) - P).mean()
+        elif self.marginal_dist == "NB":
+            # For Negative Binomial, we need an additional dispersion parameter. For simplicity, we can set it to 1 here.
+            r = torch.tensor(1.0, dtype=P.dtype, device=P.device)
+            p = r / (r + P)
+            nll = -(torch.lgamma(Y + r) - torch.lgamma(r) - torch.lgamma(Y + 1) + r * torch.log(p) + Y * torch.log(1 - p)).mean()
         else:
             raise ValueError(f"Marginal distribution {self.marginal_dist} not supported")
         return nll
@@ -115,6 +137,10 @@ class SpatialBrainLesionModel(nn.Module):
             nll = -(torch.log(P) * Y + torch.log(1 - P) * (1 - Y)).sum()
         elif marginal_dist == "Poisson":
             nll = -(Y * torch.log(P) - P).sum()
+        elif marginal_dist == "NB":
+            r = torch.tensor(1.0, dtype=P.dtype, device=P.device)
+            p_nb = r / (r + P)
+            nll = -(torch.lgamma(Y + r) - torch.lgamma(r) - torch.lgamma(Y + 1) + r * torch.log(p_nb) + Y * torch.log(1 - p_nb)).sum()
         return nll
 
 class MassUnivariateRegression(nn.Module):

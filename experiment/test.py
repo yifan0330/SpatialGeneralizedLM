@@ -2,6 +2,45 @@ import numpy as np
 import matplotlib.pyplot as plt
 import os
 
+cd /well/nichols/users/pra123/brain_lesion_project/experiment
+
+python - <<'EOF'
+import numpy as np
+from util import preprocess_Z
+from plot import save_nifti
+import nibabel as nib
+
+polynomial_order = 1
+spacing = 5
+N_UKB_subjects = 13677
+
+smooth_lesion_mask = nib.load("data/UKB/smooth_lesion_mask_RealDataset.nii.gz")
+
+data = np.load(f"data/UKB/masked_data_RealDataset_spacing_{spacing}.npz")
+Z, B = data["Z"], data["X_spatial"]
+Z = preprocess_Z(False, Z, polynomial_order)
+Z = Z * 50 / Z.shape[0]
+Z = np.concatenate([Z, np.ones((Z.shape[0], 1))], axis=1)
+Z_age_5 = np.array([0, 5, 0, 0, 0], dtype=np.float64).reshape((1,-1)) * 50 / Z.shape[0]
+
+MUM_results = np.load(
+    f"results/UKB_{N_UKB_subjects}/Regression_MassUnivariateRegression_RealDataset_approximate_model_dask_approximate_Poisson_log_link_func_spacing_5_linear.npz",
+    allow_pickle=True)
+MUM_beta = MUM_results["beta"]
+
+mu_plus  = np.exp((Z + Z_age_5) @ MUM_beta)
+mu_minus = np.exp((Z - Z_age_5) @ MUM_beta)
+P_plus   = mu_plus  * np.exp(-mu_plus)
+P_minus  = mu_minus * np.exp(-mu_minus)
+RD_MUM_age = np.mean(P_plus, axis=0) - np.mean(P_minus, axis=0)
+print("RD_MUM_age shape:", RD_MUM_age.shape)
+exit()
+
+save_nifti(RD_MUM_age.flatten(), smooth_lesion_mask, "RR_maps_13677/RD_MUM_age.nii.gz")
+print("Saved RR_maps_13677/RD_MUM_age.nii.gz")
+exit()
+
+
 result_path = "results/UKB_13677/Regression_MassUnivariateRegression_RealDataset_approximate_model_dask_approximate_Poisson_log_link_func_spacing_5_linear.npz"
 results = np.load(result_path, allow_pickle=True)
 beta = results["beta"]

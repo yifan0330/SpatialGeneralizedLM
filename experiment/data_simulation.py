@@ -357,9 +357,10 @@ class GRF_simulated_data(object):
         # age
         rng_age = np.random.default_rng(random_seed)
         outcome = dict()
-        for i in range(self.n_group):
-            n = self.n_subject[i]
-            group_name = self.group_names[i]
+        subject_offset = 0  # cumulative offset so GRF seeds are unique across groups
+        for g_idx in range(self.n_group):
+            n = self.n_subject[g_idx]
+            group_name = self.group_names[g_idx]
             ages = rng_age.uniform(low=low, high=high, size=n)
             ages = np.round(np.sort(ages), 2)
             # create empty dict and arrays
@@ -367,7 +368,7 @@ class GRF_simulated_data(object):
             Z_i = ages.copy().reshape((n, -1))
             Y_i = np.empty((n, n_voxel), dtype=np.float32)
             for i in range(n):
-                grf_seed = self.combine_seeds_int(random_seed, i)
+                grf_seed = self.combine_seeds_int(random_seed, subject_offset + i)
                 # simulated GRF
                 grf = self.simulate_grf_gaussian(mask_shape, var=1, scale=1.5, random_seed=grf_seed)
                 # Precompute xbeta (intercept only in your current R)
@@ -383,6 +384,7 @@ class GRF_simulated_data(object):
                 Y_i[i, :] = y_bin
             outcome[group_name]['Z'] = Z_i
             outcome[group_name]['Y'] = Y_i
+            subject_offset += n  # ensure next group gets unique GRF seeds
         return outcome
 
 class SpatialHomo_simulated_data(object):

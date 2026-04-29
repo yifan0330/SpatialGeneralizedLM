@@ -296,9 +296,9 @@ if args.run_data_generation:
     else: 
         if os.path.exists(smooth_lesion_mask_filename):
             smooth_lesion_mask = nib.load(smooth_lesion_mask_filename)
-            # X_spatial = QMCFeatures_3D(brain_mask=smooth_lesion_mask, length_scale=1.0, n_features=445)
+            X_spatial = QMCFeatures_3D(brain_mask=smooth_lesion_mask, length_scale=1.0, n_features=445)
             # X_spatial = RandomFourierFeatures_3D(space_dim=space_dim, dim=n_voxels, brain_mask=smooth_lesion_mask, n_features=800, sigma=0.1)
-            X_spatial = B_spline_bases(space_dim=space_dim, dim=n_voxels, brain_mask=smooth_lesion_mask, spacing=spacing, dtype=np.float64)
+            # X_spatial = B_spline_bases(space_dim=space_dim, dim=n_voxels, brain_mask=smooth_lesion_mask, spacing=spacing, dtype=np.float64)
     if simulated_dset:
         if isinstance(space_dim, int):
             lesion_size_mapping = {
@@ -340,7 +340,6 @@ if args.run_data_generation:
             Z, Y = masked_data.process_data(smooth_lesion_mask_filename)
             data = dict(X_spatial=X_spatial, Y=Y, Z=Z)
             np.savez(masked_data_filename, **data)
-        exit()
         # data = np.load(masked_data_filename, allow_pickle=True)
         # data = {key: data[key] for key in data.files}
         # print(data["X_spatial"])
@@ -371,8 +370,12 @@ if args.run_regression:
             data["Z"] = data["Z"][selected_indices]
         #######################
     # add cubic terms to Z
-    for group_name in group_names:
-        data[group_name].item()["Z"] = preprocess_Z(simulated_dset, data[group_name].item()["Z"], polynomial_order)
+    if not simulated_dset and "Z" in data and not hasattr(data.get(group_names[0], None), "item"):
+        # UKB real data: flat dict format {Y, Z, X_spatial}
+        data["Z"] = preprocess_Z(simulated_dset, data["Z"], polynomial_order)
+    else:
+        for group_name in group_names:
+            data[group_name].item()["Z"] = preprocess_Z(simulated_dset, data[group_name].item()["Z"], polynomial_order)
     result = {}
     if args.full_model:
         if not os.path.exists(results_filename):
@@ -424,9 +427,6 @@ if args.run_regression:
                 P_mean = np.mean(P_dict, axis=0)
             plot_brain(p=np.sqrt(P_mean), brain_mask=smooth_lesion_mask, vmax=None, output_filename=os.getcwd() + f"/test.png")
     else:
-        print("herehere")
-        print(results_filename)
-        print(os.path.exists(results_filename))
         dask.config.set({"distributed.worker.nthreads": 1})  # Threads per worker
         dask.config.set({"distributed.workers": os.cpu_count()})  # Number of workers
         logging.set_verbosity(logging.INFO)
@@ -489,8 +489,12 @@ if args.run_inference:
             data["Z"] = data["Z"][selected_indices]
         #######################
     # add cubic terms to Z
-    for group_name in group_names:
-        data[group_name].item()["Z"] = preprocess_Z(simulated_dset, data[group_name].item()["Z"], polynomial_order)
+    if not simulated_dset and "Z" in data and not hasattr(data.get(group_names[0], None), "item"):
+        # UKB real data: flat dict format {Y, Z, X_spatial}
+        data["Z"] = preprocess_Z(simulated_dset, data["Z"], polynomial_order)
+    else:
+        for group_name in group_names:
+            data[group_name].item()["Z"] = preprocess_Z(simulated_dset, data[group_name].item()["Z"], polynomial_order)
 
     # load optimised params
     print("results: ", results_filename)

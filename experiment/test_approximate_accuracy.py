@@ -23,10 +23,37 @@ empir_prob = load_masked_coef("data/brain/empir_prob_mask.nii.gz")
 # Ground truth: empirical mean of Y across all seeds and subjects
 Y_all = []
 for i in range(100):
-    Y_i = np.load(f"data/brain/data_Simulation/GRF_[1000]/GRF_[1000]_random_seed_{i}.npz",
-                  allow_pickle=True)["Group_1"].item()["Y"]  # (1000, 14807)
+    Y_i = np.load(f"data/brain/data_Simulation/GRF_[100]/GRF_[100]_random_seed_{i}.npz",
+                  allow_pickle=True)["Group_1"].item()["Y"]  # (100, 14807)
     Y_all.append(Y_i.mean(axis=0))  # average across subjects → (14807,)
 ground_truth_MU = np.mean(np.stack(Y_all), axis=0).reshape(1, -1)  # average across seeds → (1, 14807)
+
+# Y_approx_approx = np.load("results/brain/GRF_[100]/SpatialBrainLesion_Poisson_log/brain_Regression_Simulation_approximate_model_linear_approximate_approximate_random_seed_0.npz", allow_pickle=True)["MU_mean"]
+# Y_approx_approx = Y_approx_approx.reshape(1, -1)  # (1, n_voxel)
+# bias = np.mean(Y_approx_approx - ground_truth_MU)        # (14807,) mean across seeds
+# std = np.std(Y_approx_approx - ground_truth_MU)          # (14807,)
+# MSE = np.mean((Y_approx_approx - ground_truth_MU)**2)    # (14807,)
+# # rel
+# rel_bias = bias / np.mean(np.abs(ground_truth_MU))
+# rel_std = std / np.mean(np.abs(ground_truth_MU))
+# rel_MSE = MSE / np.mean(ground_truth_MU**2)
+
+Y_dask_approx = np.load("results/brain/GRF_[100]/SpatialBrainLesion_Poisson_log/brain_Regression_Simulation_approximate_model_linear_dask_approximate_random_seed_0.npz", allow_pickle=True)["MU_mean"]
+Y_dask_approx = Y_dask_approx.reshape(1, -1)  # (1, n_voxel)
+# compute relative bias, std, MSE, compared to ground truth, and average across voxels
+errors = Y_dask_approx - ground_truth_MU
+bias = np.mean(errors)
+std  = np.std(errors)
+MSE  = np.mean(errors**2)
+
+scale = np.mean(np.abs(ground_truth_MU))
+rel_bias = bias / scale
+rel_std  = std / scale
+rel_MSE  = MSE / np.mean(ground_truth_MU**2)
+print(rel_bias, rel_std, rel_MSE)
+exit()
+
+
 
 results = []
 for i in range(100):

@@ -9,7 +9,7 @@ polynomial_order = 1
 filename = "linear" if polynomial_order == 1 else "cubic" if polynomial_order == 3 else None
 simulated_dset = False
 spacing = 5
-N_UKB_subjects = 100
+N_UKB_subjects = 13677
 
 brain_mask = nib.load("/well/nichols/users/pra123/brain_lesion_project/real_data/MNI152_T1_2mm_brain_mask.nii.gz")
 smooth_lesion_mask = nib.load("data/UKB/smooth_lesion_mask_RealDataset.nii.gz")
@@ -30,9 +30,9 @@ Z_cvr_half *= 50 / Z.shape[0]
 # MUM: Mass Univariate Regression
 MUM_results = np.load(f"results/UKB_{N_UKB_subjects}/Regression_MassUnivariateRegression_RealDataset_approximate_model_dask_approximate_Poisson_log_link_func_spacing_5_linear.npz", allow_pickle=True)
 MUM_beta, P_MUM_mean = MUM_results["beta"], MUM_results["P_mean"]
-if not os.path.exists("RR_maps/P_MUM_mean.png"):
-    plot_brain(P_MUM_mean, smooth_lesion_mask, slice_idx=None, threshold=0, output_filename="RR_maps/P_MUM_mean.png")
-    save_nifti(P_MUM_mean.flatten(), smooth_lesion_mask, "RR_maps/P_MUM_mean.nii.gz")
+if not os.path.exists(f"RR_maps_{N_UKB_subjects}/P_MUM_mean.png"):
+    plot_brain(P_MUM_mean, smooth_lesion_mask, slice_idx=None, threshold=0, output_filename=f"RR_maps_{N_UKB_subjects}/P_MUM_mean.png")
+    save_nifti(P_MUM_mean.flatten(), smooth_lesion_mask, f"RR_maps_{N_UKB_subjects}/P_MUM_mean.nii.gz")
 
 mu_MUM_age_plus_5 = np.exp((Z+Z_age_5) @ MUM_beta)
 P_MUM_age_plus_5 = mu_MUM_age_plus_5 * np.exp(-mu_MUM_age_plus_5)
@@ -42,19 +42,19 @@ P_MUM_age_plus_5_mean = np.mean(P_MUM_age_plus_5, axis=0)
 P_MUM_age_minus_5_mean = np.mean(P_MUM_age_minus_5, axis=0)
 RR_MUM_age = P_MUM_age_plus_5_mean / P_MUM_age_minus_5_mean
 RD_MUM_age = P_MUM_age_plus_5_mean - P_MUM_age_minus_5_mean
-if not os.path.exists("RR_maps/RR_MUM_age.png"):
-    plot_brain(RR_MUM_age, smooth_lesion_mask, slice_idx=None, threshold=0, output_filename="RR_maps/RR_MUM_age.png")
-    save_nifti(RR_MUM_age.flatten(), smooth_lesion_mask, "RR_maps/RR_MUM_age.nii.gz")
-if not os.path.exists("RR_maps/RD_MUM_age.png"):
-    plot_brain(RD_MUM_age, smooth_lesion_mask, slice_idx=None, threshold=0, output_filename="RR_maps/RD_MUM_age.png")
-    save_nifti(RD_MUM_age.flatten(), smooth_lesion_mask, "RR_maps/RD_MUM_age.nii.gz")
-if not os.path.exists("RR_maps/Scatter_plot_MUM_age.png"):
+if not os.path.exists(f"RR_maps_{N_UKB_subjects}/RR_MUM_age.png"):
+    plot_brain(RR_MUM_age, smooth_lesion_mask, slice_idx=None, threshold=0, output_filename=f"RR_maps_{N_UKB_subjects}/RR_MUM_age.png")
+    save_nifti(RR_MUM_age.flatten(), smooth_lesion_mask, f"RR_maps_{N_UKB_subjects}/RR_MUM_age.nii.gz")
+if not os.path.exists(f"RR_maps_{N_UKB_subjects}/RD_MUM_age.png"):
+    plot_brain(RD_MUM_age, smooth_lesion_mask, slice_idx=None, threshold=0, output_filename=f"RR_maps_{N_UKB_subjects}/RD_MUM_age.png")
+    save_nifti(RD_MUM_age.flatten(), smooth_lesion_mask, f"RR_maps_{N_UKB_subjects}/RD_MUM_age.nii.gz")
+if not os.path.exists(f"RR_maps_{N_UKB_subjects}/Scatter_plot_MUM_age.png"):
     plt.figure()
     sc = plt.scatter(RR_MUM_age, RD_MUM_age, s=0.5)
     plt.xlabel("RR")
     plt.ylabel("RD")
     plt.title("RR vs RD for MUM-Age")
-    plt.savefig("RR_maps/Scatter_plot_MUM_age.png")
+    plt.savefig(f"RR_maps_{N_UKB_subjects}/Scatter_plot_MUM_age.png")
 
 mu_MUM_cvr_plus_half = np.exp((Z + Z_cvr_half) @ MUM_beta)
 P_MUM_cvr_plus_half = mu_MUM_cvr_plus_half * np.exp(-mu_MUM_cvr_plus_half)

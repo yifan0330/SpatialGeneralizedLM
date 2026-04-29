@@ -206,7 +206,7 @@ def plot_intensity_3d(G, p, p_hat, n_voxel, filename, slice_idx=None):
     
     return 
 
-def plot_brain(p, brain_mask, slice_idx=None, threshold=5e-4, vmax=None, output_filename="test.png"):
+def plot_brain(p, brain_mask, slice_idx=None, threshold=5e-4, vmin=0, vmax=None, output_filename="test.png"):
     print("threshold", threshold)
     brain_mask_data = brain_mask.get_fdata()
     mask_indices = np.where(brain_mask_data > 0)
@@ -227,6 +227,8 @@ def plot_brain(p, brain_mask, slice_idx=None, threshold=5e-4, vmax=None, output_
         cmap='inferno',
         threshold=threshold,
         colorbar=True,
+        vmin=vmin,
+        vmax=vmax,
         output_file=output_filename
     )
     print(output_filename)

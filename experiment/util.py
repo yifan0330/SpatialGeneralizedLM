@@ -106,6 +106,7 @@ def compute_gradient(Z,
     if mode == "approximate":
         Z_bar = Z - Z.mean(axis=1, keepdims=True)
         eta_bar = compute_eta_mean(Z, B, beta) # [_N, 1]
+        exp_eta_bar = np.exp(eta_bar)
         XTmu = np.kron(Z.T.sum(axis=1, keepdims=True), B.T @ exp_eta_bar) # [_R*_P, 1]
         B_bar = B * exp_eta_bar # [_N, _P]
         XTmu += kronecker_vector_product(Z.T @ Z_bar, B.T @ B_bar, beta) # [_R*_P, 1]
