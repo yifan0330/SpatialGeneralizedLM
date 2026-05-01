@@ -10,7 +10,7 @@ and regenerate:
 Usage
 -----
 python make_plots_from_results.py \
-    [--raw_dir  <path>]           # default: subsampling_experiment_UKB_R50/results/raw
+    [--raw_dir  <path>]           # default depends on --use_ukb
     [--plots_dir <path>]          # default: same experiment tree / results/plots
     [--metrics_dir <path>]        # default: same experiment tree / results/metrics
     [--N_list 50 100 200 ...]     # default: all N found in raw_dir
@@ -50,6 +50,7 @@ from util import preprocess_Z
 from run_subsampling_experiment import (
     compute_fpr,
     fit_sglm,
+    load_base_data,
     load_ukb_data,
     make_multigroup_data,
     mum_pvalues,
@@ -57,10 +58,8 @@ from run_subsampling_experiment import (
     stratified_subsample,
 )
 
-DEFAULT_RAW_DIR = os.path.join(
-    EXPERIMENT_DIR,
-    "subsampling_experiment_UKB_R50", "results", "raw",
-)
+DEFAULT_EXPERIMENT_PREFIX_GRF = "subsampling_experiment_GRF_R"
+DEFAULT_EXPERIMENT_PREFIX_UKB = "subsampling_experiment_UKB_R"
 NEW_KEYS = {
     "p_sglm", "z_sglm", "p_sglm_real", "z_sglm_real",
     "p_mum_real", "z_mum_real",
@@ -75,7 +74,10 @@ def get_args():
     p = argparse.ArgumentParser()
     p.add_argument("--mode", choices=["plot", "patch", "patch_and_plot"],
                    default="plot")
-    p.add_argument("--raw_dir",     default=DEFAULT_RAW_DIR)
+    p.add_argument("--use_ukb", action="store_true",
+                   help="Use UKB defaults instead of GRF defaults when --raw_dir is not provided")
+    p.add_argument("--raw_dir",     default=None,
+                   help="Input raw results directory (default depends on --use_ukb)")
     p.add_argument("--plots_dir",   default=None,
                    help="Output directory for plots (default: raw_dir/../../plots)")
     p.add_argument("--metrics_dir", default=None,
@@ -94,6 +96,33 @@ def get_args():
                    help="Re-compute missing keys even if already present")
     p.add_argument("--dry_run", action="store_true")
     return p.parse_args()
+
+
+def resolve_raw_dir(args) -> str:
+    if args.raw_dir is not None:
+        return args.raw_dir
+
+    prefix = DEFAULT_EXPERIMENT_PREFIX_UKB if args.use_ukb else DEFAULT_EXPERIMENT_PREFIX_GRF
+    candidates = []
+    for name in os.listdir(EXPERIMENT_DIR):
+        if not name.startswith(prefix):
+            continue
+        raw_dir = os.path.join(EXPERIMENT_DIR, name, "results", "raw")
+        if os.path.isdir(raw_dir):
+            candidates.append(raw_dir)
+
+    if not candidates:
+        dataset = "UKB" if args.use_ukb else "GRF"
+        raise FileNotFoundError(
+            f"No default raw results directory found for {dataset}. "
+            f"Expected a folder like {prefix}*/results/raw under {EXPERIMENT_DIR}. "
+            "Please pass --raw_dir explicitly."
+        )
+
+    candidates.sort(key=os.path.getmtime, reverse=True)
+    chosen = candidates[0]
+    logger.info("Using default raw_dir: %s", chosen)
+    return chosen
 
 
 # ---------------------------------------------------------------------------
@@ -497,10 +526,16 @@ def run_patch_mode(args):
         logger.error("No result files found in %s", args.raw_dir)
         return 1
 
-    logger.info("Loading UKB data (spacing=%d)…", args.spacing)
-    base_data = load_ukb_data(spacing=args.spacing)
-    logger.info("UKB data: n=%d, V=%d",
-                base_data["Z"].shape[0], base_data["Y"].shape[1])
+    if args.use_ukb:
+        logger.info("Loading UKB data (spacing=%d)…", args.spacing)
+        base_data = load_ukb_data(spacing=args.spacing)
+        logger.info("UKB data: n=%d, V=%d",
+                    base_data["Z"].shape[0], base_data["Y"].shape[1])
+    else:
+        logger.info("Loading GRF data (n_subject=100, seed=0)…")
+        base_data = load_base_data(n_subject=100, data_seed=0)
+        logger.info("GRF data: n=%d, V=%d",
+                    base_data["Z"].shape[0], base_data["Y"].shape[1])
 
     device = torch.device("cpu")
     n_patched = 0
@@ -561,6 +596,7 @@ def run_plot_mode(args):
 
 def main():
     args = get_args()
+    args.raw_dir = resolve_raw_dir(args)
 
     if args.mode == "patch":
         sys.exit(run_patch_mode(args))
