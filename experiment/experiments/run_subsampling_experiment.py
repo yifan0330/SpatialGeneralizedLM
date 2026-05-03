@@ -197,6 +197,41 @@ def get_args():
         choices=["FI", "sandwich"],
         help="Variance estimator for S-GLM inference",
     )
+    p.add_argument(
+        "--sglm_sandwich_meat",
+        type=str,
+        default="null_cluster",
+        choices=["cluster", "iid", "null_cluster", "null_iid"],
+        help=(
+            "Meat estimator for S-GLM sandwich inference. "
+            "'null_cluster'/'null_iid' (default): score-test sandwich — meat uses "
+            "residuals r_null = Y - mu_null where mu_null zeros out the contrast "
+            "covariate beta block. Ensures E[r_null]=0 under H0 by construction, "
+            "eliminating conservative inflation from approximate S-GLM convergence. "
+            "'cluster'/'iid': standard sandwich using fitted residuals r = Y - mu_hat."
+        ),
+    )
+    p.add_argument(
+        "--sglm_alpha",
+        type=float,
+        default=0.05,
+        help=(
+            "Step size for S-GLM regression updates. Larger values converge faster "
+            "but can be unstable; 0.05 is a stable default for UKB calibration."
+        ),
+    )
+    p.add_argument(
+        "--sglm_max_iter",
+        type=int,
+        default=2000,
+        help="Maximum S-GLM regression iterations; increased to avoid under-converged beta estimates.",
+    )
+    p.add_argument(
+        "--sglm_tol",
+        type=float,
+        default=1e-6,
+        help="S-GLM convergence tolerance, applied to both absolute and relative beta update norms.",
+    )
     p.add_argument("--marginal_dist", type=str, default="Poisson")
     p.add_argument("--link_func", type=str, default="log")
     p.add_argument(
@@ -430,8 +465,15 @@ def fit_sglm(
     link_func: str,
     device: torch.device,
     simulated_dset: bool = True,
+    alpha: float = 0.05,
+    max_iter: int = 2000,
+    tol: float = 1e-6,
 ) -> dict:
     """Fit S-GLM and return params dict."""
+    if alpha <= 0:
+        raise ValueError(f"S-GLM alpha must be positive, got {alpha}")
+    if max_iter <= 0:
+        raise ValueError(f"S-GLM max_iter must be positive, got {max_iter}")
     BR = BrainRegression_Approximate(
         simulated_dset=simulated_dset,
         dtype=torch.float64,
@@ -442,8 +484,9 @@ def fit_sglm(
         model="SpatialBrainLesion",
         marginal_dist=marginal_dist,
         link_func=link_func,
-        max_iter=200,
-        alpha=0.01,
+        tol=tol,
+        max_iter=max_iter,
+        alpha=alpha,
         gradient_mode="dask",
         preconditioner_mode="approximate",
         block_size=5000,
@@ -462,6 +505,7 @@ def sglm_pvalues(
     age_col_preprocessed: int = 0,
     marginal_dist: str = "Poisson",
     link_func: str = "log",
+    sandwich_meat: str = "null_cluster",
 ):
     """Run S-GLM inference and return flattened p-values and z-statistics."""
     BI = BrainInference_Approximate(
@@ -493,7 +537,7 @@ def sglm_pvalues(
             polynomial_order=polynomial_order,
         )
 
-    p_vals, z_stats = BI._glh_con_group(inference_method)
+    p_vals, z_stats = BI._glh_con_group(inference_method, sandwich_meat=sandwich_meat)
     return np.asarray(p_vals).ravel(), np.asarray(z_stats).ravel()
 
 
@@ -747,6 +791,9 @@ def run_one_rep(
         args.link_func,
         device,
         simulated_dset=simulated_dset,
+        alpha=args.sglm_alpha,
+        max_iter=args.sglm_max_iter,
+        tol=args.sglm_tol,
     )
 
     try:
@@ -760,6 +807,7 @@ def run_one_rep(
             age_col_preprocessed=age_col_preprocessed,
             marginal_dist=args.marginal_dist,
             link_func=args.link_func,
+            sandwich_meat=args.sglm_sandwich_meat,
         )
         result["p_sglm_real"] = p_sglm_real.astype(np.float32)
         result["z_sglm_real"] = z_sglm_real.astype(np.float32)
@@ -839,6 +887,9 @@ def run_one_rep(
             args.link_func,
             device,
             simulated_dset=simulated_dset,
+            alpha=args.sglm_alpha,
+            max_iter=args.sglm_max_iter,
+            tol=args.sglm_tol,
         )
         p_sglm, z_sglm = sglm_pvalues(
             data_perm,
@@ -850,6 +901,7 @@ def run_one_rep(
             age_col_preprocessed=age_col_preprocessed,
             marginal_dist=args.marginal_dist,
             link_func=args.link_func,
+            sandwich_meat=args.sglm_sandwich_meat,
         )
         result["p_sglm"] = p_sglm.astype(np.float32)
         result["z_sglm"] = z_sglm.astype(np.float32)

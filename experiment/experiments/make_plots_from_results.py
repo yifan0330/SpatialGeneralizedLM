@@ -33,6 +33,22 @@ import numpy as np
 from scipy.stats import beta as beta_dist
 import torch
 
+plt.rcParams.update({
+    "font.family": "DejaVu Sans",
+    "font.size": 9,
+    "axes.labelsize": 10,
+    "axes.titlesize": 10,
+    "axes.linewidth": 0.8,
+    "legend.fontsize": 8,
+    "xtick.labelsize": 9,
+    "ytick.labelsize": 9,
+    "figure.dpi": 150,
+    "savefig.dpi": 300,
+    "savefig.bbox": "tight",
+    "pdf.fonttype": 42,
+    "ps.fonttype": 42,
+})
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
@@ -346,10 +362,23 @@ def _pp_curve_mean_ci(ax, p_list, colour, label, ci=0.95):
     y_lo = _neglog10_p(hi)
     y_hi = _neglog10_p(lo)
 
-    ax.fill_between(x_plot, y_lo, y_hi, color=colour, alpha=0.15,
-                    label=f"{label} {int(ci * 100)}% Beta CI")
-    ax.plot(x_plot, y_mean, color=colour, lw=1.4,
-            label=f"{label} (R={R})", alpha=0.9)
+    ax.fill_between(
+        x_plot,
+        y_lo,
+        y_hi,
+        color=colour,
+        alpha=0.16,
+        linewidth=0,
+        label=f"{label} {int(ci * 100)}% CI",
+    )
+    ax.plot(
+        x_plot,
+        y_mean,
+        color=colour,
+        lw=1.8,
+        label=f"{label} mean, R={R}",
+        alpha=0.95,
+    )
 
     finite_vals = np.concatenate([
         x_plot[np.isfinite(x_plot)],
@@ -360,11 +389,44 @@ def _pp_curve_mean_ci(ax, p_list, colour, label, ci=0.95):
     return float(np.max(finite_vals)) if finite_vals.size else None
 
 
+def _style_pp_axis(ax, max_val: float, panel_label: str, alpha_line: float):
+    """Apply consistent manuscript-style formatting to one PP-plot axis."""
+    ax.plot([0, max_val], [0, max_val], color="black", ls="--", lw=1.0,
+        label="Ref")
+    ax.axhline(alpha_line, color="0.35", linestyle=":", lw=1.0,
+           label=r"$\alpha=0.05$")
+    ax.axvline(alpha_line, color="0.35", linestyle=":", lw=1.0)
+    ax.set_xlabel(r"Expected quantile, $-\log_{10}(p)$")
+    ax.set_ylabel(r"Observed quantile, $-\log_{10}(p)$")
+    ax.set_xlim(0, max_val)
+    ax.set_ylim(0, max_val)
+    ax.set_aspect("equal", adjustable="box")
+    ax.grid(True, color="0.90", linewidth=0.6)
+    ax.tick_params(direction="out", length=3, width=0.8)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.text(
+        0.02,
+        0.98,
+        panel_label,
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=11,
+        fontweight="bold",
+    )
+
+
 def make_pp_plot(results: list, N: int, plots_dir: str, ts: str,
-                 R_label: int = None):
+                 R_label: int = None, alpha_threshold: float = 0.05):
     """Two-panel PP-plot for a given N: null (left) and real data (right)."""
     p_sglm_null, p_mum_null = [], []
     p_sglm_real, p_mum_real = [], []
+    alpha_line = _neglog10_p(alpha_threshold)
+    colours = {
+        "sglm": "#D55E00",  # vermillion, colourblind-safe
+        "mum": "#0072B2",   # blue, colourblind-safe
+    }
 
     for r in results:
         if r["N"] != N:
@@ -383,51 +445,48 @@ def make_pp_plot(results: list, N: int, plots_dir: str, ts: str,
         return
 
     R = R_label or len([r for r in results if r["N"] == N])
-    fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+    fig, axes = plt.subplots(1, 2, figsize=(7.2, 3.6), constrained_layout=True)
 
     # Left: null (permuted age)
     ax = axes[0]
     max_null = max(
         [0.0] + [
             v for v in [
-                _pp_curve_mean_ci(ax, p_sglm_null, "#E64646", "S-GLM (null)"),
-                _pp_curve_mean_ci(ax, p_mum_null,  "#4682B4", "MUM (null)"),
+                _pp_curve_mean_ci(ax, p_sglm_null, colours["sglm"], "S-GLM"),
+                _pp_curve_mean_ci(ax, p_mum_null,  colours["mum"], "MUM"),
             ]
             if v is not None
         ]
     )
-    max_null = max(1.0, max_null)
-    ax.plot([0, max_null], [0, max_null], "k--", lw=1, label="Ideal (uniform)")
-    ax.set_xlabel("Expected quantile (-log10 p)")
-    ax.set_ylabel("Observed quantile (-log10 p)")
-    ax.set_title(f"PP-plot — AGE (null, permuted)  |  N={N}  R={R}")
-    ax.legend(fontsize=8)
-    ax.set_xlim(0, max_null); ax.set_ylim(0, max_null)
+    max_null = max(1.0, max_null, alpha_line) * 1.02
+    _style_pp_axis(ax, max_null, "A", alpha_line)
+    ax.set_title(f"Permuted-age null (N={N}, R={R})", pad=8)
+    ax.legend(frameon=False, fontsize=7, handlelength=1.5,
+              loc="upper left", bbox_to_anchor=(0.05, 0.95))
 
     # Right: real data
     ax = axes[1]
     max_real = max(
         [0.0] + [
             v for v in [
-                _pp_curve_mean_ci(ax, p_sglm_real, "#E64646", "S-GLM (real)"),
-                _pp_curve_mean_ci(ax, p_mum_real,  "#4682B4", "MUM (real)"),
+                _pp_curve_mean_ci(ax, p_sglm_real, colours["sglm"], "S-GLM"),
+                _pp_curve_mean_ci(ax, p_mum_real,  colours["mum"], "MUM"),
             ]
             if v is not None
         ]
     )
-    max_real = max(1.0, max_real)
-    ax.plot([0, max_real], [0, max_real], "k--", lw=1, label="Ideal (uniform)")
-    ax.set_xlabel("Expected quantile (-log10 p)")
-    ax.set_ylabel("Observed quantile (-log10 p)")
-    ax.set_title(f"PP-plot — AGE (real data)  |  N={N}  R={R}")
-    ax.legend(fontsize=8)
-    ax.set_xlim(0, max_real); ax.set_ylim(0, max_real)
+    max_real = max(1.0, max_real, alpha_line) * 1.02
+    _style_pp_axis(ax, max_real, "B", alpha_line)
+    ax.set_title(f"Observed UKB data (N={N}, R={R})", pad=8)
+    ax.legend(frameon=False, fontsize=7, handlelength=1.5,
+              loc="upper left", bbox_to_anchor=(0.05, 0.95))
 
-    fig.tight_layout()
     out = os.path.join(plots_dir, f"PPplot_N{N}_{ts}.png")
-    fig.savefig(out, dpi=150)
+    out_pdf = os.path.join(plots_dir, f"PPplot_N{N}_{ts}.pdf")
+    fig.savefig(out)
+    fig.savefig(out_pdf)
     plt.close(fig)
-    logger.info("Saved PP-plot (N=%d) → %s", N, out)
+    logger.info("Saved PP-plot (N=%d) → %s and %s", N, out, out_pdf)
 
 
 # ---------------------------------------------------------------------------
@@ -573,7 +632,8 @@ def run_plot_mode(args):
     # PP-plots per N
     for N in N_vals:
         R = sum(1 for r in results if r["N"] == N)
-        make_pp_plot(results, N, plots_dir, ts, R_label=R)
+        make_pp_plot(results, N, plots_dir, ts, R_label=R,
+                     alpha_threshold=args.alpha_threshold)
 
     # FPR summary
     rows = aggregate_metrics(results, args.alpha_threshold)

@@ -686,7 +686,7 @@ class BrainInference_Approximate(object):
         if fig_filename is not None:
             self.plot_1d(p_vals, fig_filename, 0.05)
 
-    def _glh_con_group(self, method, use_dask=True, batch_size=20):
+    def _glh_con_group(self, method, use_dask=True, batch_size=20, sandwich_meat="null_cluster"):
         # Compute the per-covariate spatial effect maps: beta_map[s, j] = B[j,:] @ beta_reshape[:,s]
         # This directly tests H0: contrast @ beta_map[:, j] = 0 at each voxel j,
         # which is the correct null for "does covariate s have a spatially-varying effect?".
@@ -706,10 +706,31 @@ class BrainInference_Approximate(object):
             logger.info("Fisher Information computed in %.1fs", time.time() - start_time)
         elif method == "sandwich":
             MU_matrix = self.MU.reshape(self._M, self._N)
-            cov_beta_full = self.poisson_sandwich_kron(
-                self.Z, self.B, self.Y, MU_matrix, meat="cluster", ridge=0.0
-            )  # (R*P, R*P)
-            logger.info("Sandwich estimator computed in %.1fs", time.time() - start_time)
+            # null_cluster / null_iid: score-test sandwich.
+            # Zero out the contrast covariate beta block, recompute mu_null,
+            # use r_null = Y - mu_null in the meat.  E[r_null] = 0 under H0
+            # by construction, eliminating inflation from approximate convergence.
+            if sandwich_meat in ("null_cluster", "null_iid"):
+                beta_null = self.beta.copy().reshape(self._P, self._R, order="F")  # (P, R)
+                for s in range(self.contrast_vector.shape[0]):
+                    for r_idx in range(self._R):
+                        if self.contrast_vector[s, r_idx] != 0:
+                            beta_null[:, r_idx] = 0.0
+                beta_null_flat = beta_null.reshape(-1, 1, order="F")
+                MU_null = compute_mu(
+                    self.Z, self.B, beta_null_flat, mode="dask", block_size=1000
+                ).reshape(self._M, self._N)
+                logger.info("Null mu computed for score-test sandwich (zeroed contrast covariate block)")
+                base_meat = sandwich_meat[len("null_"):]  # 'cluster' or 'iid'
+                cov_beta_full = self.poisson_sandwich_kron(
+                    self.Z, self.B, self.Y, MU_matrix,
+                    meat=base_meat, ridge=0.0, mu_for_meat=MU_null,
+                )  # (R*P, R*P)
+            else:
+                cov_beta_full = self.poisson_sandwich_kron(
+                    self.Z, self.B, self.Y, MU_matrix, meat=sandwich_meat, ridge=0.0
+                )  # (R*P, R*P)
+            logger.info("Sandwich estimator (%s) computed in %.1fs", sandwich_meat, time.time() - start_time)
 
         if method == "FI":
             # Var(c[s] * B_j @ beta_s) = c[s]^2 * B_j^T Cov(beta_s) B_j  (block-diagonal approx)
@@ -747,11 +768,17 @@ class BrainInference_Approximate(object):
                                 mu,
                                 *,
                                 meat="cluster",
-                                ridge=0.0):
+                                ridge=0.0,
+                                mu_for_meat=None):
         """Memory-efficient sandwich covariance for Poisson log-link GLM.
 
-        This mirrors the UKB implementation and avoids materializing the
-        full Kronecker design matrix.
+        Args:
+            mu: fitted means used for the bread (Hessian).
+            mu_for_meat: if provided, residuals r = y - mu_for_meat are used
+                in the meat instead of y - mu.  Pass the null-model mu
+                (contrast covariate block zeroed) to get score-test residuals
+                that are centred under H0 by construction (eliminates sandwich
+                inflation from approximate S-GLM convergence).
         """
         Z  = np.asarray(Z,  dtype=float)
         B  = np.asarray(B,  dtype=float)
@@ -771,7 +798,15 @@ class BrainInference_Approximate(object):
         mu = np.nan_to_num(mu, nan=0.0, posinf=1e12, neginf=0.0)
         mu = np.clip(mu, 1e-12, 1e12)
 
-        r = np.nan_to_num(y - mu, nan=0.0, posinf=0.0, neginf=0.0)
+        # Use separate mu for meat residuals if provided (score-test sandwich).
+        if mu_for_meat is not None:
+            mu_r = np.asarray(mu_for_meat, dtype=float)
+            mu_r = np.nan_to_num(mu_r, nan=0.0, posinf=1e12, neginf=0.0)
+            mu_r = np.clip(mu_r, 1e-12, 1e12)
+        else:
+            mu_r = mu
+
+        r = np.nan_to_num(y - mu_r, nan=0.0, posinf=0.0, neginf=0.0)
 
         w_bread = np.einsum('ik,il,ij->klj', Z, Z, mu)
         A = np.zeros((p, p))

@@ -416,19 +416,31 @@ def fit_multiplicative_log_glm(Z, B, Y, tol=1e-10, max_iter=100,
                                    mode=preconditioner_mode, block_size=block_size, damping_factor=1e-4)
         # C = eigen_clip(C, min_val=-1e4, max_val=1e4)
         beta_new = beta - alpha * C @ G
+        if not np.isfinite(beta_new).all():
+            raise FloatingPointError(
+                "S-GLM regression produced non-finite beta values. "
+                "Try reducing --sglm_alpha or using a smaller step size."
+            )
         # if iteration % 5 == 0:
         #     np.savez(f"{checkpoint_path}/iter_{iteration}.npy", beta=beta_new, G=G, C=C)
         delta_beta = np.linalg.norm(beta_new - beta)
+        rel_delta_beta = delta_beta / max(np.linalg.norm(beta), 1.0)
         beta = beta_new
         if compute_nll:
             nll = compute_log_poisson_nll(Z, B, beta, Y, mode=nll_mode, block_size=block_size)
-            logging.info(f"--> Iteration: {iteration}, delta beta: {delta_beta}, NLL: {nll}")
+            logging.info(f"--> Iteration: {iteration}, delta beta: {delta_beta}, rel delta beta: {rel_delta_beta}, NLL: {nll}")
             logging.info(f"--> Min beta: {np.min(beta)}, Max beta: {np.max(beta)}")
         else:
-            logging.info(f"--> Iteration: {iteration}, delta beta: {delta_beta}")
-        if delta_beta < tol:
+            logging.info(f"--> Iteration: {iteration}, delta beta: {delta_beta}, rel delta beta: {rel_delta_beta}")
+        if delta_beta < tol or rel_delta_beta < tol:
             logging.info(f"Converged in {iteration + 1} iterations.")
             break
+    else:
+        logging.warning(
+            f"S-GLM did not converge within max_iter={max_iter}; "
+            f"last delta beta={delta_beta}, last rel delta beta={rel_delta_beta}. "
+            "Increase --sglm_max_iter or reduce --sglm_tol if needed."
+        )
     return beta
 
 def fit_MUM_log_glm(Z, B, Y, marginal_dist, link_func,
