@@ -35,18 +35,21 @@ import torch
 
 plt.rcParams.update({
     "font.family": "DejaVu Sans",
-    "font.size": 9,
+    "font.size": 8.5,
     "axes.labelsize": 10,
     "axes.titlesize": 10,
+    "axes.titleweight": "semibold",
     "axes.linewidth": 0.8,
-    "legend.fontsize": 8,
+    "legend.fontsize": 7.5,
     "xtick.labelsize": 9,
     "ytick.labelsize": 9,
     "figure.dpi": 150,
     "savefig.dpi": 300,
     "savefig.bbox": "tight",
+    "savefig.pad_inches": 0.03,
     "pdf.fonttype": 42,
     "ps.fonttype": 42,
+    "mathtext.fontset": "dejavusans",
 })
 
 logging.basicConfig(
@@ -310,6 +313,56 @@ def _neglog10_p(x):
     return -np.log10(x)
 
 
+def _mean_rejection_percent(p_list, alpha_threshold: float):
+    """Average percent of voxels rejected at the given threshold."""
+    if not p_list:
+        return None
+
+    rates = []
+    for a in p_list:
+        a = np.asarray(a).ravel()
+        a = a[np.isfinite(a)]
+        a = a[(a >= 0) & (a <= 1)]
+        if a.size == 0:
+            continue
+        rates.append(100.0 * float(np.mean(a < alpha_threshold)))
+
+    if not rates:
+        return None
+    return float(np.mean(rates))
+
+
+def _add_rejection_text(ax, entries, alpha_threshold: float):
+    """Add a small text box summarizing voxel rejection percentages."""
+    lines = [rf"Rejected voxels ($p<{alpha_threshold:g}$)"]
+    for label, value in entries:
+        if value is not None:
+            lines.append(f"{label}: {value:.2f}%")
+
+    if len(lines) == 1:
+        return
+
+    ax.text(
+        0.965,
+        0.055,
+        "\n".join(lines),
+        transform=ax.transAxes,
+        ha="right",
+        va="bottom",
+        fontsize=6.8,
+        linespacing=1.25,
+        color="0.20",
+        bbox={
+            "boxstyle": "round,pad=0.30,rounding_size=0.08",
+            "facecolor": "white",
+            "edgecolor": "0.85",
+            "linewidth": 0.6,
+            "alpha": 0.94,
+        },
+        zorder=10,
+    )
+
+
 def _pp_curve_mean_ci(ax, p_list, colour, label, ci=0.95):
     """Plot mean PP-curve across realisations with pointwise Beta-distribution CI.
 
@@ -367,17 +420,20 @@ def _pp_curve_mean_ci(ax, p_list, colour, label, ci=0.95):
         y_lo,
         y_hi,
         color=colour,
-        alpha=0.16,
+        alpha=0.12,
         linewidth=0,
-        label=f"{label} {int(ci * 100)}% CI",
+        label="_nolegend_",
+        zorder=1,
     )
     ax.plot(
         x_plot,
         y_mean,
         color=colour,
-        lw=1.8,
-        label=f"{label} mean, R={R}",
+        lw=2.0,
+        label=label,
         alpha=0.95,
+        solid_capstyle="round",
+        zorder=3,
     )
 
     finite_vals = np.concatenate([
@@ -389,32 +445,64 @@ def _pp_curve_mean_ci(ax, p_list, colour, label, ci=0.95):
     return float(np.max(finite_vals)) if finite_vals.size else None
 
 
-def _style_pp_axis(ax, max_val: float, panel_label: str, alpha_line: float):
+def _style_pp_axis(ax, max_val: float, panel_label: str, alpha_line: float,
+                   alpha_threshold: float):
     """Apply consistent manuscript-style formatting to one PP-plot axis."""
-    ax.plot([0, max_val], [0, max_val], color="black", ls="--", lw=1.0,
-        label="Ref")
+    ax.plot([0, max_val], [0, max_val], color="0.15", ls="--", lw=1.0,
+        label="Uniform", zorder=2)
     ax.axhline(alpha_line, color="0.35", linestyle=":", lw=1.0,
-           label=r"$\alpha=0.05$")
+           label=rf"$p={alpha_threshold:g}$")
     ax.axvline(alpha_line, color="0.35", linestyle=":", lw=1.0)
-    ax.set_xlabel(r"Expected quantile, $-\log_{10}(p)$")
-    ax.set_ylabel(r"Observed quantile, $-\log_{10}(p)$")
+    ax.set_xlabel(r"Expected $-\log_{10}(p)$")
+    ax.set_ylabel(r"Observed $-\log_{10}(p)$")
     ax.set_xlim(0, max_val)
     ax.set_ylim(0, max_val)
     ax.set_aspect("equal", adjustable="box")
-    ax.grid(True, color="0.90", linewidth=0.6)
+    ax.grid(True, color="0.90", linewidth=0.55)
     ax.tick_params(direction="out", length=3, width=0.8)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
+    ax.spines["left"].set_color("0.25")
+    ax.spines["bottom"].set_color("0.25")
     ax.text(
-        0.02,
-        0.98,
+        -0.10,
+        1.04,
         panel_label,
         transform=ax.transAxes,
         ha="left",
-        va="top",
-        fontsize=11,
+        va="bottom",
+        fontsize=12,
         fontweight="bold",
+        clip_on=False,
     )
+
+
+def _clean_pp_legend(ax):
+    """Use a compact legend suitable for a two-panel manuscript figure."""
+    handles, labels = ax.get_legend_handles_labels()
+    seen = set()
+    clean_handles, clean_labels = [], []
+    for handle, label in zip(handles, labels):
+        if label == "_nolegend_" or label in seen:
+            continue
+        seen.add(label)
+        clean_handles.append(handle)
+        clean_labels.append(label)
+    ax.legend(
+        clean_handles,
+        clean_labels,
+        frameon=True,
+        fancybox=False,
+        framealpha=0.94,
+        edgecolor="0.85",
+        facecolor="white",
+        fontsize=7,
+        handlelength=1.8,
+        handletextpad=0.45,
+        borderpad=0.30,
+        labelspacing=0.30,
+        loc="upper left",
+        bbox_to_anchor=(0.045, 0.955))
 
 
 def make_pp_plot(results: list, N: int, plots_dir: str, ts: str,
@@ -445,10 +533,12 @@ def make_pp_plot(results: list, N: int, plots_dir: str, ts: str,
         return
 
     R = R_label or len([r for r in results if r["N"] == N])
-    fig, axes = plt.subplots(1, 2, figsize=(7.2, 3.6), constrained_layout=True)
+    fig, axes = plt.subplots(1, 2, figsize=(7.35, 3.45), constrained_layout=True)
 
     # Left: null (permuted age)
     ax = axes[0]
+    null_rej_sglm = _mean_rejection_percent(p_sglm_null, alpha_threshold)
+    null_rej_mum = _mean_rejection_percent(p_mum_null, alpha_threshold)
     max_null = max(
         [0.0] + [
             v for v in [
@@ -459,13 +549,16 @@ def make_pp_plot(results: list, N: int, plots_dir: str, ts: str,
         ]
     )
     max_null = max(1.0, max_null, alpha_line) * 1.02
-    _style_pp_axis(ax, max_null, "A", alpha_line)
-    ax.set_title(f"Permuted-age null (N={N}, R={R})", pad=8)
-    ax.legend(frameon=False, fontsize=7, handlelength=1.5,
-              loc="upper left", bbox_to_anchor=(0.05, 0.95))
+    _style_pp_axis(ax, max_null, "A", alpha_line, alpha_threshold)
+    ax.set_title(f"Permuted-age null\n$N={N}$, $R={R}$", pad=7)
+    _clean_pp_legend(ax)
+    _add_rejection_text(ax, [("S-GLM", null_rej_sglm), ("MUM", null_rej_mum)],
+                        alpha_threshold)
 
     # Right: real data
     ax = axes[1]
+    real_rej_sglm = _mean_rejection_percent(p_sglm_real, alpha_threshold)
+    real_rej_mum = _mean_rejection_percent(p_mum_real, alpha_threshold)
     max_real = max(
         [0.0] + [
             v for v in [
@@ -476,10 +569,11 @@ def make_pp_plot(results: list, N: int, plots_dir: str, ts: str,
         ]
     )
     max_real = max(1.0, max_real, alpha_line) * 1.02
-    _style_pp_axis(ax, max_real, "B", alpha_line)
-    ax.set_title(f"Observed UKB data (N={N}, R={R})", pad=8)
-    ax.legend(frameon=False, fontsize=7, handlelength=1.5,
-              loc="upper left", bbox_to_anchor=(0.05, 0.95))
+    _style_pp_axis(ax, max_real, "B", alpha_line, alpha_threshold)
+    ax.set_title(f"Observed UKB data\n$N={N}$, $R={R}$", pad=7)
+    _clean_pp_legend(ax)
+    _add_rejection_text(ax, [("S-GLM", real_rej_sglm), ("MUM", real_rej_mum)],
+                        alpha_threshold)
 
     out = os.path.join(plots_dir, f"PPplot_N{N}_{ts}.png")
     out_pdf = os.path.join(plots_dir, f"PPplot_N{N}_{ts}.pdf")

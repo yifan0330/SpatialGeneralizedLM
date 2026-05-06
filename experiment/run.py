@@ -73,7 +73,7 @@ def get_args():
                         help="Name of groups (default: Group_1, Group_2, etc.)")
     parser.add_argument('--n_subject', nargs='+',type=int, default=[1000],
                         help="Number of subjects (default: [1000])")
-    parser.add_argument('--spacing', type=int, default=10,
+    parser.add_argument('--spacing', type=int, default=5,
                         help="Spacing for B-spline basis (default: 10)")
     parser.add_argument('--lesion_per_subject', nargs='+', type=int, default=[10],
                         help="Number of lesions per subject (default: 10). Accepts a single integer or a comma-separated list of integers.")
@@ -150,6 +150,7 @@ filename_components = {
     "model": "_full_model" if args.full_model else "_approximate_model",
     "poly": get_polynomial_suffix(polynomial_order),
     "firth": "_firth_penalty" if args.firth_penalty else "",
+    "subset_seed": f"_random_seed_{args.random_seed}" if (not simulated_dset and UKB_subject is not None and UKB_subject < n_subjects_whole_UKB) else "",
 }
 
 # Common parameters for UKB dataset
@@ -226,8 +227,8 @@ def _build_simulated_brain_filenames(base_path, space_dim, model, filename_compo
 
 def _build_ukb_filenames(base_path, model, filename_components, optimization_params, args):
     """Build filenames for UKB real dataset."""
-    ukb_base_params = f"{model}{filename_components['dset']}{filename_components['model']}_{optimization_params['gradient']}_{optimization_params['precond']}_{optimization_params['marginal']}_{optimization_params['link']}_link_func_spacing_{optimization_params['spacing']}{filename_components['poly']}{filename_components['firth']}"
-    common_suffix = f"{filename_components['dset']}{filename_components['model']}{filename_components['poly']}_{model}_{optimization_params['marginal']}_{optimization_params['link']}_link_func"
+    ukb_base_params = f"{model}{filename_components['dset']}{filename_components['model']}_{optimization_params['gradient']}_{optimization_params['precond']}_{optimization_params['marginal']}_{optimization_params['link']}_link_func_spacing_{optimization_params['spacing']}{filename_components['poly']}{filename_components['firth']}{filename_components['subset_seed']}"
+    common_suffix = f"{filename_components['dset']}{filename_components['model']}{filename_components['poly']}_{model}_{optimization_params['marginal']}_{optimization_params['link']}_link_func{filename_components['subset_seed']}"
     
     lesion_mask = f"{base_path}/data/UKB/lesion_mask{filename_components['dset']}.nii.gz"
     filenames = {
@@ -244,7 +245,7 @@ def _build_ukb_filenames(base_path, model, filename_components, optimization_par
         "bread_term_filename": f"{base_path}/results/{filename_components['UKB_subject']}/bread_term_{ukb_base_params}.npz",
         "p_vals_filename": f"{base_path}/results/{filename_components['UKB_subject']}/p_values_{ukb_base_params}_{args.inference_method}.npz",
         "z_vals_filename": f"{base_path}/results/{filename_components['UKB_subject']}/z_values_{ukb_base_params}_{args.inference_method}.npz",
-        "fig_filename": f"{base_path}/figures/{filename_components['UKB_subject']}/spacing_{optimization_params['spacing']}/Z_map_{args.model}_{args.inference_method}{filename_components['dset']}{filename_components['model']}_{optimization_params['gradient']}_{optimization_params['precond']}_{optimization_params['marginal']}_{optimization_params['link']}_link_func_spacing_{optimization_params['spacing']}{filename_components['poly']}{filename_components['firth']}{args.inference_method}_{args.contrast_name}.png",
+        "fig_filename": f"{base_path}/figures/{filename_components['UKB_subject']}/spacing_{optimization_params['spacing']}/Z_map_{args.model}_{args.inference_method}{filename_components['dset']}{filename_components['model']}_{optimization_params['gradient']}_{optimization_params['precond']}_{optimization_params['marginal']}_{optimization_params['link']}_link_func_spacing_{optimization_params['spacing']}{filename_components['poly']}{filename_components['firth']}{filename_components['subset_seed']}{args.inference_method}_{args.contrast_name}.png",
     }
     # Create directories
     for key in ["results_filename", "inference_filename", "fig_filename"]:
@@ -277,6 +278,8 @@ brain_mask_path = os.path.dirname(os.getcwd()) + "/GRF_data/MNI152_T1_2mm_brain_
 brain_mask = nib.load(brain_mask_path) if space_dim == "brain" else None
 smooth_lesion_mask = nib.load(smooth_lesion_mask_filename) if smooth_lesion_mask_filename and os.path.exists(smooth_lesion_mask_filename) else None
 n_voxels = np.sum(smooth_lesion_mask.get_fdata() > 0)
+data_subsetted = False
+data_preprocessed = False
 
 if args.run_data_generation:
     logging.info(f"Generate data{filename_components['dset']}...")
@@ -361,13 +364,14 @@ if args.run_regression:
         #######################
         # subset data for testing model performance
         if UKB_subject < n_subjects_whole_UKB:
-            np.random.seed(42)
+            np.random.seed(args.random_seed)
             selected_indices = np.random.choice(n_subjects_whole_UKB, size=UKB_subject, replace=False)
             # total_needed = 5 * UKB_subject
             # all_selected_indices = np.random.choice(n_subjects_whole_UKB, size=total_needed, replace=False)
             # selected_indices = all_selected_indices[4*UKB_subject:]
             data["Y"] = data["Y"][selected_indices]
             data["Z"] = data["Z"][selected_indices]
+            data_subsetted = True
         #######################
     # add cubic terms to Z
     if not simulated_dset and "Z" in data and not hasattr(data.get(group_names[0], None), "item"):
@@ -376,6 +380,7 @@ if args.run_regression:
     else:
         for group_name in group_names:
             data[group_name].item()["Z"] = preprocess_Z(simulated_dset, data[group_name].item()["Z"], polynomial_order)
+    data_preprocessed = True
     result = {}
     if args.full_model:
         if not os.path.exists(results_filename):
@@ -479,22 +484,25 @@ if args.run_inference:
     if not simulated_dset and space_dim == "brain":
         #######################
         # subset data for testing model performance
-        if UKB_subject < n_subjects_whole_UKB:
-            np.random.seed(42)
+        if UKB_subject < n_subjects_whole_UKB and not data_subsetted:
+            np.random.seed(args.random_seed)
             selected_indices = np.random.choice(n_subjects_whole_UKB, size=UKB_subject, replace=False)
             # total_needed = 5 * UKB_subject
             # all_selected_indices = np.random.choice(n_subjects_whole_UKB, size=total_needed, replace=False)
             # selected_indices = all_selected_indices[4*UKB_subject:]
             data["Y"] = data["Y"][selected_indices]
             data["Z"] = data["Z"][selected_indices]
+            data_subsetted = True
         #######################
     # add cubic terms to Z
-    if not simulated_dset and "Z" in data and not hasattr(data.get(group_names[0], None), "item"):
-        # UKB real data: flat dict format {Y, Z, X_spatial}
-        data["Z"] = preprocess_Z(simulated_dset, data["Z"], polynomial_order)
-    else:
-        for group_name in group_names:
-            data[group_name].item()["Z"] = preprocess_Z(simulated_dset, data[group_name].item()["Z"], polynomial_order)
+    if not data_preprocessed:
+        if not simulated_dset and "Z" in data and not hasattr(data.get(group_names[0], None), "item"):
+            # UKB real data: flat dict format {Y, Z, X_spatial}
+            data["Z"] = preprocess_Z(simulated_dset, data["Z"], polynomial_order)
+        else:
+            for group_name in group_names:
+                data[group_name].item()["Z"] = preprocess_Z(simulated_dset, data[group_name].item()["Z"], polynomial_order)
+        data_preprocessed = True
 
     # load optimised params
     print("results: ", results_filename)

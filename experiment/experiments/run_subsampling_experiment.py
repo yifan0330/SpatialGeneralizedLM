@@ -212,6 +212,20 @@ def get_args():
         ),
     )
     p.add_argument(
+        "--sglm_sandwich_correction",
+        type=str,
+        default="hc3",
+        choices=["hc0", "hc1", "hc3"],
+        help=(
+            "Small-sample correction for S-GLM sandwich covariance. "
+            "'hc0' uses the raw sandwich. 'hc1' multiplies the meat by M/(M-R), "
+            "where M is the number of subjects and R is the number of covariates "
+            "including the intercept. 'hc3' divides score residuals by (1-h_ij), "
+            "so squared residual contributions are scaled by 1/(1-h_ij)^2; this "
+            "is the default for better small-N/high-leverage finite-sample behavior."
+        ),
+    )
+    p.add_argument(
         "--sglm_alpha",
         type=float,
         default=0.05,
@@ -506,6 +520,7 @@ def sglm_pvalues(
     marginal_dist: str = "Poisson",
     link_func: str = "log",
     sandwich_meat: str = "null_cluster",
+    sandwich_correction: str = "hc3",
 ):
     """Run S-GLM inference and return flattened p-values and z-statistics."""
     BI = BrainInference_Approximate(
@@ -537,7 +552,11 @@ def sglm_pvalues(
             polynomial_order=polynomial_order,
         )
 
-    p_vals, z_stats = BI._glh_con_group(inference_method, sandwich_meat=sandwich_meat)
+    p_vals, z_stats = BI._glh_con_group(
+        inference_method,
+        sandwich_meat=sandwich_meat,
+        sandwich_correction=sandwich_correction,
+    )
     return np.asarray(p_vals).ravel(), np.asarray(z_stats).ravel()
 
 
@@ -808,6 +827,7 @@ def run_one_rep(
             marginal_dist=args.marginal_dist,
             link_func=args.link_func,
             sandwich_meat=args.sglm_sandwich_meat,
+            sandwich_correction=args.sglm_sandwich_correction,
         )
         result["p_sglm_real"] = p_sglm_real.astype(np.float32)
         result["z_sglm_real"] = z_sglm_real.astype(np.float32)
@@ -902,6 +922,7 @@ def run_one_rep(
             marginal_dist=args.marginal_dist,
             link_func=args.link_func,
             sandwich_meat=args.sglm_sandwich_meat,
+            sandwich_correction=args.sglm_sandwich_correction,
         )
         result["p_sglm"] = p_sglm.astype(np.float32)
         result["z_sglm"] = z_sglm.astype(np.float32)

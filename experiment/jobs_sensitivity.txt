@@ -1,0 +1,8 @@
+run_subset_sensitivity.py --seeds 0 1 2 3 4 5 --UKB_subject 50 --plot_z_maps True
+run_subset_sensitivity.py --seeds 0 1 2 3 4 5 --UKB_subject 100 --plot_z_maps True
+run_subset_sensitivity.py --seeds 0 1 2 3 4 5 --UKB_subject 200 --plot_z_maps True
+run_subset_sensitivity.py --seeds 0 1 2 3 4 5 --UKB_subject 300 --plot_z_maps True
+run_subset_sensitivity.py --seeds 0 1 2 3 4 5 --UKB_subject 400 --plot_z_maps True
+run_subset_sensitivity.py --seeds 0 1 2 3 4 5 --UKB_subject 500 --plot_z_maps True
+run_subset_sensitivity.py --seeds 0 1 2 3 4 5 --UKB_subject 1000 --plot_z_maps True
+run_subset_sensitivity.py --seeds 0 1 2 3 4 5 --UKB_subject 2000 --plot_z_maps True

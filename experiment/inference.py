@@ -686,7 +686,14 @@ class BrainInference_Approximate(object):
         if fig_filename is not None:
             self.plot_1d(p_vals, fig_filename, 0.05)
 
-    def _glh_con_group(self, method, use_dask=True, batch_size=20, sandwich_meat="null_cluster"):
+    def _glh_con_group(
+        self,
+        method,
+        use_dask=True,
+        batch_size=20,
+        sandwich_meat="null_cluster",
+        sandwich_correction="hc3",
+    ):
         # Compute the per-covariate spatial effect maps: beta_map[s, j] = B[j,:] @ beta_reshape[:,s]
         # This directly tests H0: contrast @ beta_map[:, j] = 0 at each voxel j,
         # which is the correct null for "does covariate s have a spatially-varying effect?".
@@ -724,13 +731,27 @@ class BrainInference_Approximate(object):
                 base_meat = sandwich_meat[len("null_"):]  # 'cluster' or 'iid'
                 cov_beta_full = self.poisson_sandwich_kron(
                     self.Z, self.B, self.Y, MU_matrix,
-                    meat=base_meat, ridge=0.0, mu_for_meat=MU_null,
+                    meat=base_meat,
+                    ridge=0.0,
+                    mu_for_meat=MU_null,
+                    correction=sandwich_correction,
                 )  # (R*P, R*P)
             else:
                 cov_beta_full = self.poisson_sandwich_kron(
-                    self.Z, self.B, self.Y, MU_matrix, meat=sandwich_meat, ridge=0.0
+                    self.Z,
+                    self.B,
+                    self.Y,
+                    MU_matrix,
+                    meat=sandwich_meat,
+                    ridge=0.0,
+                    correction=sandwich_correction,
                 )  # (R*P, R*P)
-            logger.info("Sandwich estimator (%s) computed in %.1fs", sandwich_meat, time.time() - start_time)
+            logger.info(
+                "Sandwich estimator (%s, %s) computed in %.1fs",
+                sandwich_meat,
+                sandwich_correction,
+                time.time() - start_time,
+            )
 
         if method == "FI":
             # Var(c[s] * B_j @ beta_s) = c[s]^2 * B_j^T Cov(beta_s) B_j  (block-diagonal approx)
@@ -769,7 +790,8 @@ class BrainInference_Approximate(object):
                                 *,
                                 meat="cluster",
                                 ridge=0.0,
-                                mu_for_meat=None):
+                                mu_for_meat=None,
+                                correction="hc3"):
         """Memory-efficient sandwich covariance for Poisson log-link GLM.
 
         Args:
@@ -779,6 +801,12 @@ class BrainInference_Approximate(object):
                 (contrast covariate block zeroed) to get score-test residuals
                 that are centred under H0 by construction (eliminates sandwich
                 inflation from approximate S-GLM convergence).
+            correction: 'hc0' for raw sandwich, 'hc1' to multiply the meat by
+                M/(M-R), where M is subjects and R is covariates including the
+                intercept, or 'hc3' to divide each score residual by
+                (1 - h_ij), equivalently scaling each squared residual by
+                1/(1 - h_ij)^2. Here h_ij is the weighted GLM leverage for
+                subject i and voxel j under the Kronecker S-GLM design.
         """
         Z  = np.asarray(Z,  dtype=float)
         B  = np.asarray(B,  dtype=float)
@@ -824,6 +852,43 @@ class BrainInference_Approximate(object):
         A = np.nan_to_num(A, nan=0.0, posinf=1e12, neginf=-1e12)
         A = 0.5 * (A + A.T)
 
+        correction_kind = correction.lower()
+        if correction_kind == "hc0":
+            hc_factor = 1.0
+        elif correction_kind == "hc1":
+            if M <= R:
+                raise ValueError(
+                    f"HC1 correction requires M > R, got M={M}, R={R}. "
+                    "Use correction='hc0' for this setting."
+                )
+            hc_factor = M / float(M - R)
+        elif correction_kind == "hc3":
+            hc_factor = 1.0
+            ridge_eps = max(ridge, 1e-8)
+            try:
+                L_h, low_h = scipy.linalg.cho_factor(A + ridge_eps * np.eye(p))
+                Ainv_for_h = scipy.linalg.cho_solve((L_h, low_h), np.eye(p))
+            except (np.linalg.LinAlgError, ValueError):
+                logger.warning("Cholesky failed while computing HC3 leverage — using pseudo-inverse")
+                A_safe = np.nan_to_num(A, nan=0.0, posinf=1e12, neginf=-1e12)
+                Ainv_for_h = np.linalg.pinv(A_safe + 1e-6 * np.eye(p))
+
+            Ainv_blocks = Ainv_for_h.reshape(R, P, R, P).transpose(0, 2, 1, 3)
+            leverage_basis = np.einsum('jp,klpq,jq->klj', B, Ainv_blocks, B)
+            hii = mu * np.einsum('ik,il,klj->ij', Z, Z, leverage_basis)
+            hii = np.nan_to_num(hii, nan=0.0, posinf=1.0, neginf=0.0)
+            hii = np.clip(hii, 0.0, 0.999)
+            r = r / np.maximum(1.0 - hii, 1e-6)
+            logger.info(
+                "Applying HC3 sandwich correction: leverage min/mean/max = %.4g / %.4g / %.4g",
+                float(np.min(hii)), float(np.mean(hii)), float(np.max(hii)),
+            )
+            del Ainv_for_h, Ainv_blocks, leverage_basis, hii
+        else:
+            raise ValueError("correction must be 'hc0', 'hc1', or 'hc3'.")
+        if hc_factor != 1.0:
+            logger.info("Applying HC1 sandwich meat correction: M/(M-R)=%.6g", hc_factor)
+
         meat_kind = meat.lower()
         if meat_kind == "cluster":
             Bt_r = B.T @ r.T
@@ -865,6 +930,7 @@ class BrainInference_Approximate(object):
                 Bmeat_safe = np.nan_to_num(Bmeat, nan=0.0, posinf=1e12, neginf=-1e12)
                 cov = Ainv @ Bmeat_safe @ Ainv
 
+        cov *= hc_factor
         cov = 0.5 * (cov + cov.T)
         return cov
     
