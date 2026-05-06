@@ -23,6 +23,10 @@ from datetime import datetime
 from itertools import combinations
 from pathlib import Path
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib as mpl
 import numpy as np
 import nibabel as nib
 from scipy.stats import norm
@@ -31,6 +35,14 @@ from plot import plot_brain
 
 
 DEFAULT_MODELS = ["SpatialBrainLesion", "MassUnivariateRegression"]
+MODEL_TO_METHOD = {
+    "SpatialBrainLesion": "S-GLM",
+    "MassUnivariateRegression": "MUM",
+}
+METHOD_TO_SUBSAMPLING_KEY = {
+    "S-GLM": "z_sglm_real",
+    "MUM": "z_mum_real",
+}
 
 
 def get_args() -> argparse.Namespace:
@@ -78,6 +90,48 @@ def get_args() -> argparse.Namespace:
         "--stop_on_error",
         action="store_true",
         help="Stop after the first failed run.py command.",
+    )
+    parser.add_argument(
+        "--skip_runs",
+        action="store_true",
+        help="Skip calling run.py and only summarize/plot existing results.",
+    )
+    parser.add_argument(
+        "--plot_combined_z_maps",
+        type=lambda x: x.lower() == "true",
+        default=False,
+        help=(
+            "Create one Z-map figure per N from existing subsampling results. "
+            "Each figure has two rows, S-GLM and MUM, with one column per requested seed. "
+            "The requested --seeds values are interpreted as subsampling repetition indices "
+            "when --skip_runs is used."
+        ),
+    )
+    parser.add_argument(
+        "--subsampling_raw_dir",
+        default=None,
+        help=(
+            "Raw rep_*.npz directory from run_subsampling_experiment.py. Default: "
+            "experiments/subsampling_experiment_UKB_R100/results/raw."
+        ),
+    )
+    parser.add_argument(
+        "--combined_N_list",
+        nargs="+",
+        type=int,
+        default=None,
+        help="Subset of N values to include in the combined Z-map figure.",
+    )
+    parser.add_argument(
+        "--combined_z_slice",
+        type=int,
+        default=18,
+        help="MNI/world z coordinate for the combined Z-map figure; default matches cut_coords z=18.",
+    )
+    parser.add_argument(
+        "--combined_zmap_output",
+        default=None,
+        help="Output PNG path for the combined Z-map figure.",
     )
     return parser.parse_args()
 
@@ -258,6 +312,7 @@ def write_csv(path: Path, rows: list[dict]) -> None:
 def _load_matching_brain_mask(project_dir: Path, expected_voxels: int) -> nib.Nifti1Image:
     """Load the lesion/brain mask whose positive voxels match a Z-map length."""
     candidates = [
+        project_dir / "data" / "UKB" / "smooth_lesion_mask_RealDataset.nii.gz",
         project_dir / "data" / "brain" / "smooth_lesion_mask_Simulation.nii.gz",
         project_dir / "data" / "UKB" / "lesion_mask_RealDataset.nii.gz",
         project_dir.parent / "GRF_data" / "MNI152_T1_2mm_brain_mask.nii.gz",
@@ -274,6 +329,289 @@ def _load_matching_brain_mask(project_dir: Path, expected_voxels: int) -> nib.Ni
         f"No mask with {expected_voxels} positive voxels found. "
         f"Checked: {checked}"
     )
+
+
+def _parse_subsampling_rep_file(path: Path) -> tuple[int, int, int] | None:
+    """Parse rep_N{N}_rep{rep}_seed{seed}.npz filenames."""
+    try:
+        parts = path.stem.split("_")
+        N = int(parts[1][1:])
+        rep = int(parts[2][3:])
+        seed = int(parts[3][4:])
+        return N, rep, seed
+    except (IndexError, ValueError):
+        return None
+
+
+def _finite_mean_stack(arrays: list[np.ndarray]) -> tuple[np.ndarray, int]:
+    """Mean across arrays without warning when some voxels are missing in every array."""
+    min_len = min(a.size for a in arrays)
+    stack = np.vstack([a[:min_len] for a in arrays])
+    finite = np.isfinite(stack)
+    counts = np.sum(finite, axis=0)
+    sums = np.sum(np.where(finite, stack, 0.0), axis=0)
+    mean = np.full(min_len, np.nan, dtype=float)
+    np.divide(sums, counts, out=mean, where=counts > 0)
+    return mean, stack.shape[0]
+
+
+def _mean_subsampling_zmaps(raw_dir: Path, N_list: list[int] | None) -> dict[str, dict[int, tuple[np.ndarray, int]]]:
+    """Average real-data subsampling Z-maps across all random seeds for each N."""
+    wanted = set(N_list) if N_list is not None else None
+    grouped: dict[str, dict[int, list[np.ndarray]]] = {
+        "S-GLM": {},
+        "MUM": {},
+    }
+
+    for path in sorted(raw_dir.glob("rep_N*_rep*_seed*.npz")):
+        parsed = _parse_subsampling_rep_file(path)
+        if parsed is None:
+            continue
+        N, _, _ = parsed
+        if wanted is not None and N not in wanted:
+            continue
+
+        with np.load(path, allow_pickle=False) as data:
+            for method, key in METHOD_TO_SUBSAMPLING_KEY.items():
+                if key not in data.files:
+                    continue
+                z = np.asarray(data[key], dtype=float).ravel()
+                if z.size:
+                    grouped[method].setdefault(N, []).append(z)
+
+    means: dict[str, dict[int, tuple[np.ndarray, int]]] = {"S-GLM": {}, "MUM": {}}
+    for method, by_N in grouped.items():
+        for N, arrays in by_N.items():
+            if not arrays:
+                continue
+            means[method][N] = _finite_mean_stack(arrays)
+    return means
+
+
+def _load_subsampling_zmaps_by_rep(raw_dir: Path, N_list: list[int] | None,
+                                   reps: list[int]) -> dict[int, dict[int, dict[str, np.ndarray]]]:
+    """Load real-data S-GLM/MUM Z-maps by N and repetition index."""
+    wanted_N = set(N_list) if N_list is not None else None
+    wanted_reps = set(reps)
+    out: dict[int, dict[int, dict[str, np.ndarray]]] = {}
+
+    for path in sorted(raw_dir.glob("rep_N*_rep*_seed*.npz")):
+        parsed = _parse_subsampling_rep_file(path)
+        if parsed is None:
+            continue
+        N, rep, _ = parsed
+        if wanted_N is not None and N not in wanted_N:
+            continue
+        if rep not in wanted_reps:
+            continue
+
+        with np.load(path, allow_pickle=False) as data:
+            entry = out.setdefault(N, {}).setdefault(rep, {})
+            for method, key in METHOD_TO_SUBSAMPLING_KEY.items():
+                if key in data.files:
+                    z = np.asarray(data[key], dtype=float).ravel()
+                    if z.size:
+                        entry[method] = z
+    return out
+
+
+def _mean_sensitivity_zmaps(results_dir: Path, models: list[str], seeds: list[int],
+                            inference_method: str) -> dict[str, tuple[np.ndarray, int]]:
+    """Average subset-sensitivity Z-maps across the requested seeds."""
+    means = {}
+    for model in models:
+        method = MODEL_TO_METHOD.get(model, model)
+        arrays = []
+        for seed in seeds:
+            z_file = _find_result_file(results_dir, "z_values", model, seed, inference_method)
+            if z_file is None:
+                continue
+            z = _load_first_array(z_file, preferred_key="z_stats")
+            if z.size:
+                arrays.append(z)
+        if arrays:
+            means[method] = _finite_mean_stack(arrays)
+    return means
+
+
+def _crop_white_border(img: np.ndarray, pad: int = 4) -> np.ndarray:
+    """Crop near-white margins from a rendered nilearn panel image."""
+    if img.ndim < 3:
+        return img
+    rgb = img[..., :3]
+    non_white = np.any(rgb < 0.985, axis=2)
+    if not np.any(non_white):
+        return img
+
+    rows = np.where(np.any(non_white, axis=1))[0]
+    cols = np.where(np.any(non_white, axis=0))[0]
+    r0 = max(int(rows[0]) - pad, 0)
+    r1 = min(int(rows[-1]) + pad + 1, img.shape[0])
+    c0 = max(int(cols[0]) - pad, 0)
+    c1 = min(int(cols[-1]) + pad + 1, img.shape[1])
+    return img[r0:r1, c0:c1]
+
+
+def _z_vector_to_slice(z: np.ndarray, brain_mask: nib.Nifti1Image, z_coord: int) -> np.ndarray:
+    """Project a masked Z vector back into volume space and return one MNI z-coordinate slice."""
+    mask_data = brain_mask.get_fdata() > 0
+    n_mask = int(np.sum(mask_data))
+    if z.size != n_mask:
+        raise ValueError(f"Z-map has {z.size} voxels but mask has {n_mask}")
+
+    voxel = nib.affines.apply_affine(np.linalg.inv(brain_mask.affine), [[0, 0, z_coord]])[0]
+    z_slice = int(round(voxel[2]))
+    if not (0 <= z_slice < mask_data.shape[2]):
+        raise ValueError(
+            f"z_coord={z_coord} maps to slice index {z_slice}, outside valid range "
+            f"0-{mask_data.shape[2] - 1}"
+        )
+
+    volume = np.full(mask_data.shape, np.nan, dtype=np.float32)
+    volume[mask_data] = z.astype(np.float32, copy=False)
+    return np.rot90(volume[:, :, z_slice])
+
+
+def plot_combined_subsampling_sensitivity_zmaps(results_dir: Path, project_dir: Path,
+                                                args: argparse.Namespace,
+                                                timestamp: str) -> list[Path]:
+    """Create one figure per N with S-GLM/MUM rows and seed/repetition columns.
+
+    Each panel is first rendered by plot.plot_brain so the combined figure uses
+    the same nilearn brain-template view as the per-seed sensitivity Z-maps.
+    """
+    if args.subsampling_raw_dir is None:
+        raw_dir = project_dir / "experiments" / "subsampling_experiment_UKB_R100" / "results" / "raw"
+    else:
+        raw_dir = Path(args.subsampling_raw_dir)
+    if not raw_dir.is_dir():
+        print(f"Subsampling raw directory not found: {raw_dir}", file=sys.stderr)
+        return []
+
+    z_by_N_rep = _load_subsampling_zmaps_by_rep(raw_dir, args.combined_N_list, args.seeds)
+    all_vectors = [
+        z
+        for by_rep in z_by_N_rep.values()
+        for by_method in by_rep.values()
+        for z in by_method.values()
+    ]
+    if not all_vectors:
+        print("No matching subsampling Z-map arrays found for requested N/reps.", file=sys.stderr)
+        return []
+
+    expected_voxels = all_vectors[0].size
+    brain_mask = _load_matching_brain_mask(project_dir, expected_voxels)
+    finite_chunks = [np.abs(z[np.isfinite(z)]) for z in all_vectors if np.isfinite(z).any()]
+    finite_abs = np.concatenate(finite_chunks) if finite_chunks else np.array([], dtype=float)
+    z_vmax = float(np.nanpercentile(finite_abs, 99.0)) if finite_abs.size else 1.0
+    z_vmax = max(z_vmax, 1.0)
+
+    output_paths = []
+    for N in sorted(z_by_N_rep):
+        if args.combined_zmap_output is None:
+            output_png = results_dir / f"subsampling_zmaps_N{N}_zslice{args.combined_z_slice}_{timestamp}.png"
+        else:
+            output_base = Path(args.combined_zmap_output)
+            output_png = output_base.with_name(f"{output_base.stem}_N{N}{output_base.suffix}")
+        output_png.parent.mkdir(parents=True, exist_ok=True)
+        output_pdf = output_png.with_suffix(".pdf")
+
+        panel_dir = output_png.parent / f"{output_png.stem}_panels"
+        panel_dir.mkdir(parents=True, exist_ok=True)
+        panel_images: dict[str, dict[int, Path]] = {"S-GLM": {}, "MUM": {}}
+        for method in ("S-GLM", "MUM"):
+            for rep in args.seeds:
+                z_map = z_by_N_rep.get(N, {}).get(rep, {}).get(method)
+                if z_map is None:
+                    continue
+                safe_method = method.replace("-", "").replace(" ", "_")
+                panel_path = panel_dir / f"{safe_method}_seed{rep}.png"
+                plot_brain(
+                    p=z_map,
+                    brain_mask=brain_mask,
+                    slice_idx=args.combined_z_slice,
+                    threshold=0,
+                    vmin=-z_vmax,
+                    vmax=z_vmax,
+                    output_filename=str(panel_path),
+                    colorbar=False,
+                )
+                panel_images[method][rep] = panel_path
+
+        plt.rcParams.update({
+            "font.family": "DejaVu Sans",
+            "font.size": 8.5,
+            "axes.titlesize": 9,
+            "axes.titleweight": "semibold",
+            "savefig.dpi": 300,
+            "pdf.fonttype": 42,
+            "ps.fonttype": 42,
+        })
+        fig, axes = plt.subplots(
+            2,
+            len(args.seeds),
+            figsize=(3.05 * len(args.seeds), 4.65),
+            constrained_layout=False,
+        )
+        axes = np.atleast_2d(axes)
+        for row, method in enumerate(("S-GLM", "MUM")):
+            for col, rep in enumerate(args.seeds):
+                ax = axes[row, col]
+                panel_path = panel_images[method].get(rep)
+                if panel_path is None:
+                    ax.axis("off")
+                    continue
+                ax.imshow(_crop_white_border(plt.imread(panel_path)))
+                ax.set_xticks([])
+                ax.set_yticks([])
+                ax.set_frame_on(False)
+                for spine in ax.spines.values():
+                    spine.set_visible(False)
+                if row == 0:
+                    ax.set_title(f"seed={rep}", fontsize=9, pad=3)
+            axes[row, 0].text(
+                -0.04,
+                0.5,
+                method,
+                transform=axes[row, 0].transAxes,
+                ha="right",
+                va="center",
+                rotation=90,
+                fontsize=11,
+                fontweight="bold",
+            )
+
+        fig.subplots_adjust(
+            left=0.035,
+            right=0.955,
+            bottom=0.035,
+            top=0.93,
+            wspace=0.002,
+            hspace=0.015,
+        )
+        sm = mpl.cm.ScalarMappable(
+            norm=mpl.colors.Normalize(vmin=-z_vmax, vmax=z_vmax),
+            cmap="inferno",
+        )
+        sm.set_array([])
+        cbar = fig.colorbar(
+            sm,
+            ax=axes.ravel().tolist(),
+            location="right",
+            shrink=0.92,
+            pad=0.004,
+            fraction=0.018,
+        )
+        cbar.set_label("Z statistic", rotation=270, labelpad=12)
+        cbar.outline.set_visible(False)
+        fig.savefig(output_png, dpi=300)
+        fig.savefig(output_pdf)
+        plt.close(fig)
+        print("Saved Z-map figure:", output_png)
+        print("Saved Z-map PDF:", output_pdf)
+        output_paths.append(output_png)
+
+    return output_paths
 
 
 def plot_sensitivity_z_maps(results_dir: Path, project_dir: Path, args: argparse.Namespace,
@@ -384,24 +722,27 @@ def main() -> int:
     results_dir.mkdir(parents=True, exist_ok=True)
 
     failures = []
-    for seed in args.seeds:
-        for model in args.models:
-            cmd = build_command(args, model, seed)
-            print("\n" + "=" * 80, flush=True)
-            print(f"Running model={model}, seed={seed}", flush=True)
-            print(" ".join(cmd), flush=True)
-            if args.dry_run:
-                continue
-            completed = subprocess.run(cmd, cwd=project_dir)
-            if completed.returncode != 0:
-                failures.append({"model": model, "seed": seed, "returncode": completed.returncode})
-                if args.stop_on_error:
-                    print(f"Stopping after failure: {failures[-1]}", file=sys.stderr)
-                    return completed.returncode
-            else:
-                moved = archive_run_outputs(ukb_dir, results_dir, model, seed)
-                if moved:
-                    print(f"Archived {len(moved)} files to {results_dir}", flush=True)
+    if not args.skip_runs:
+        for seed in args.seeds:
+            for model in args.models:
+                cmd = build_command(args, model, seed)
+                print("\n" + "=" * 80, flush=True)
+                print(f"Running model={model}, seed={seed}", flush=True)
+                print(" ".join(cmd), flush=True)
+                if args.dry_run:
+                    continue
+                completed = subprocess.run(cmd, cwd=project_dir)
+                if completed.returncode != 0:
+                    failures.append({"model": model, "seed": seed, "returncode": completed.returncode})
+                    if args.stop_on_error:
+                        print(f"Stopping after failure: {failures[-1]}", file=sys.stderr)
+                        return completed.returncode
+                else:
+                    moved = archive_run_outputs(ukb_dir, results_dir, model, seed)
+                    if moved:
+                        print(f"Archived {len(moved)} files to {results_dir}", flush=True)
+    else:
+        print("Skipping run.py calls and using existing result files.", flush=True)
 
     if args.dry_run:
         return 0
@@ -427,10 +768,23 @@ def main() -> int:
         zmap_csv = results_dir / f"subset_sensitivity_zmap_plots_{timestamp}.csv"
         write_csv(zmap_csv, zmap_rows)
 
+    combined_zmaps = []
+    if args.plot_combined_z_maps:
+        combined_zmaps = plot_combined_subsampling_sensitivity_zmaps(
+            results_dir,
+            project_dir,
+            args,
+            timestamp,
+        )
+
     print("\nSaved sensitivity summary:", summary_csv)
     print("Saved pairwise stability summary:", stability_csv)
     if zmap_rows:
         print("Saved sensitivity Z-map plot summary:", zmap_csv)
+    if combined_zmaps:
+        print("Saved subsampling Z-map figures:")
+        for path in combined_zmaps:
+            print("  ", path)
     if failures:
         failure_csv = results_dir / f"subset_run_failures_{timestamp}.csv"
         write_csv(failure_csv, failures)

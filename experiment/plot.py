@@ -1,13 +1,7 @@
 import matplotlib.pyplot as plt
 from nilearn.plotting import plot_stat_map
-import nilearn.maskers
 import nibabel as nib
-import seaborn as sns
 import numpy as np
-import nilearn
-import matplotlib.colors as mcolors
-import matplotlib.cm as cm
-import os
 
 def plot_intensity_1d(G, p, p_hat, filename):
     group_names = list(G.keys())
@@ -206,7 +200,8 @@ def plot_intensity_3d(G, p, p_hat, n_voxel, filename, slice_idx=None):
     
     return 
 
-def plot_brain(p, brain_mask, slice_idx=None, threshold=5e-4, vmin=0, vmax=None, output_filename="test.png"):
+def plot_brain(p, brain_mask, slice_idx=None, threshold=5e-4, vmin=0, vmax=None,
+               output_filename="test.png", colorbar=True):
     print("threshold", threshold)
     brain_mask_data = brain_mask.get_fdata()
     mask_indices = np.where(brain_mask_data > 0)
@@ -219,14 +214,15 @@ def plot_brain(p, brain_mask, slice_idx=None, threshold=5e-4, vmin=0, vmax=None,
     # # Only display the values below the threshold 0.05
     # Create a new NIfTI image
     nifti_image = nib.Nifti1Image(nifti_data, affine=brain_mask.affine, header=brain_mask.header)
+    cut_coords = [slice_idx] if slice_idx is not None else [0, 6, 12, 18, 24, 30, 36]
     plot_stat_map(
         nifti_image, 
-        cut_coords=[0,6,12,18,24,30,36],
+        cut_coords=cut_coords,
         display_mode='z', 
         draw_cross=False, 
         cmap='inferno',
         threshold=threshold,
-        colorbar=True,
+        colorbar=colorbar,
         vmin=vmin,
         vmax=vmax,
         output_file=output_filename
