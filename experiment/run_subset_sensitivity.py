@@ -133,6 +133,20 @@ def get_args() -> argparse.Namespace:
         default=None,
         help="Output PNG path for the combined Z-map figure.",
     )
+    parser.add_argument(
+        "--include_sensitivity_frequency",
+        type=lambda x: x.lower() == "true",
+        default=True,
+        help=(
+            "Add a final per-row panel showing cross-seed significant-voxel "
+            "frequency from results/UKB_<N>/subset_sensitivity."
+        ),
+    )
+    parser.add_argument(
+        "--sensitivity_frequency_cmap",
+        default="viridis",
+        help="Colourmap for sensitivity-frequency panels; Z-map panels keep inferno.",
+    )
     return parser.parse_args()
 
 
@@ -434,6 +448,33 @@ def _mean_sensitivity_zmaps(results_dir: Path, models: list[str], seeds: list[in
     return means
 
 
+def _sensitivity_frequency_for_N(project_dir: Path, N: int, models: list[str],
+                                 reps: list[int], inference_method: str,
+                                 alpha: float) -> dict[str, tuple[np.ndarray, int]]:
+    """Return significant-voxel frequency maps for sensitivity runs at one N."""
+    sens_dir = project_dir / "results" / f"UKB_{N}" / "subset_sensitivity"
+    if not sens_dir.is_dir():
+        return {}
+
+    z_threshold = float(norm.ppf(1.0 - alpha))
+    frequency_maps = {}
+    for model in models:
+        method = MODEL_TO_METHOD.get(model, model)
+        masks = []
+        for rep in reps:
+            z_file = _find_result_file(sens_dir, "z_values", model, rep, inference_method)
+            if z_file is None:
+                continue
+            z = _load_first_array(z_file, preferred_key="z_stats")
+            if z.size:
+                masks.append((np.isfinite(z) & (np.abs(z) >= z_threshold)).astype(float))
+        if masks:
+            min_len = min(mask.size for mask in masks)
+            stack = np.vstack([mask[:min_len] for mask in masks])
+            frequency_maps[method] = (np.mean(stack, axis=0), stack.shape[0])
+    return frequency_maps
+
+
 def _crop_white_border(img: np.ndarray, pad: int = 4) -> np.ndarray:
     """Crop near-white margins from a rendered nilearn panel image."""
     if img.ndim < 3:
@@ -519,6 +560,7 @@ def plot_combined_subsampling_sensitivity_zmaps(results_dir: Path, project_dir: 
         panel_dir = output_png.parent / f"{output_png.stem}_panels"
         panel_dir.mkdir(parents=True, exist_ok=True)
         panel_images: dict[str, dict[int, Path]] = {"S-GLM": {}, "MUM": {}}
+        frequency_images: dict[str, Path] = {}
         for method in ("S-GLM", "MUM"):
             for rep in args.seeds:
                 z_map = z_by_N_rep.get(N, {}).get(rep, {}).get(method)
@@ -538,6 +580,32 @@ def plot_combined_subsampling_sensitivity_zmaps(results_dir: Path, project_dir: 
                 )
                 panel_images[method][rep] = panel_path
 
+        if args.include_sensitivity_frequency:
+            frequency_maps = _sensitivity_frequency_for_N(
+                project_dir,
+                N,
+                args.models,
+                args.seeds,
+                args.inference_method,
+                args.alpha,
+            )
+            for method, (freq_map, n_maps) in frequency_maps.items():
+                if method not in frequency_images:
+                    safe_method = method.replace("-", "").replace(" ", "_")
+                    panel_path = panel_dir / f"{safe_method}_sensitivity_frequency.png"
+                    plot_brain(
+                        p=freq_map,
+                        brain_mask=brain_mask,
+                        slice_idx=args.combined_z_slice,
+                        threshold=0,
+                        vmin=0,
+                        vmax=1,
+                        output_filename=str(panel_path),
+                        colorbar=False,
+                        cmap=args.sensitivity_frequency_cmap,
+                    )
+                    frequency_images[method] = panel_path
+
         plt.rcParams.update({
             "font.family": "DejaVu Sans",
             "font.size": 8.5,
@@ -547,10 +615,11 @@ def plot_combined_subsampling_sensitivity_zmaps(results_dir: Path, project_dir: 
             "pdf.fonttype": 42,
             "ps.fonttype": 42,
         })
+        n_cols = len(args.seeds) + (1 if frequency_images else 0)
         fig, axes = plt.subplots(
             2,
-            len(args.seeds),
-            figsize=(3.05 * len(args.seeds), 4.65),
+            n_cols,
+            figsize=(3.05 * n_cols, 4.65),
             constrained_layout=False,
         )
         axes = np.atleast_2d(axes)
@@ -569,6 +638,20 @@ def plot_combined_subsampling_sensitivity_zmaps(results_dir: Path, project_dir: 
                     spine.set_visible(False)
                 if row == 0:
                     ax.set_title(f"seed={rep}", fontsize=9, pad=3)
+            if frequency_images:
+                ax = axes[row, len(args.seeds)]
+                panel_path = frequency_images.get(method)
+                if panel_path is None:
+                    ax.axis("off")
+                else:
+                    ax.imshow(_crop_white_border(plt.imread(panel_path)))
+                    ax.set_xticks([])
+                    ax.set_yticks([])
+                    ax.set_frame_on(False)
+                    for spine in ax.spines.values():
+                        spine.set_visible(False)
+                    if row == 0:
+                        ax.set_title("Sensitivity\nfrequency", fontsize=9, pad=3)
             axes[row, 0].text(
                 -0.04,
                 0.5,
@@ -594,9 +677,10 @@ def plot_combined_subsampling_sensitivity_zmaps(results_dir: Path, project_dir: 
             cmap="inferno",
         )
         sm.set_array([])
+        z_colorbar_axes = axes[:, :len(args.seeds)].ravel().tolist() if frequency_images else axes.ravel().tolist()
         cbar = fig.colorbar(
             sm,
-            ax=axes.ravel().tolist(),
+            ax=z_colorbar_axes,
             location="right",
             shrink=0.92,
             pad=0.004,
@@ -604,6 +688,22 @@ def plot_combined_subsampling_sensitivity_zmaps(results_dir: Path, project_dir: 
         )
         cbar.set_label("Z statistic", rotation=270, labelpad=12)
         cbar.outline.set_visible(False)
+        if frequency_images:
+            sm_freq = mpl.cm.ScalarMappable(
+                norm=mpl.colors.Normalize(vmin=0, vmax=1),
+                cmap=args.sensitivity_frequency_cmap,
+            )
+            sm_freq.set_array([])
+            cbar_freq = fig.colorbar(
+                sm_freq,
+                ax=axes[:, len(args.seeds)].ravel().tolist(),
+                location="right",
+                shrink=0.92,
+                pad=0.030,
+                fraction=0.030,
+            )
+            cbar_freq.set_label("Frequency", rotation=270, labelpad=12)
+            cbar_freq.outline.set_visible(False)
         fig.savefig(output_png, dpi=300)
         fig.savefig(output_pdf)
         plt.close(fig)
@@ -700,6 +800,7 @@ def plot_sensitivity_z_maps(results_dir: Path, project_dir: Path, args: argparse
                 vmin=0,
                 vmax=1,
                 output_filename=str(output_file),
+                cmap=args.sensitivity_frequency_cmap,
             )
             rows.append({
                 "model": model,

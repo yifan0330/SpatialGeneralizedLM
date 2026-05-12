@@ -63,7 +63,7 @@ for _p in (PARENT_DIR, EXPERIMENT_DIR):
         sys.path.insert(0, _p)
 
 from regression import BrainRegression_Approximate
-from inference import BrainInference_Approximate
+from inference import BrainInference
 from util import preprocess_Z
 
 # ---------------------------------------------------------------------------
@@ -523,8 +523,9 @@ def sglm_pvalues(
     sandwich_correction: str = "hc3",
 ):
     """Run S-GLM inference and return flattened p-values and z-statistics."""
-    BI = BrainInference_Approximate(
+    BI = BrainInference(
         model="SpatialBrainLesion",
+        inference_type="approximate",
         marginal_dist=marginal_dist,
         link_func=link_func,
         regression_terms=["multiplicative", "additive"],
