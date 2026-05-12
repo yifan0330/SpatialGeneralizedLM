@@ -14,18 +14,675 @@ from statsmodels.stats.multitest import fdrcorrection
 
 logger = logging.getLogger(__name__)
 
-class BrainInference_full(object):
-    def __init__(self, model,space_dim, marginal_dist, link_func, regression_terms, random_seed, fewer_voxels=False,
-                dtype=torch.float64, device='cpu'):
+class BrainInference:
+    """Unified public interface for brain-lesion inference.
+
+    Parameters
+    ----------
+    inference_type : {"full", "approximate", "ukb"}
+        Selects the inference backend. The public API is intentionally the
+        same for all backends: call ``load_params()``, ``create_contrast()``,
+        then ``run_inference()``.
+    """
+
+    _BACKENDS = {
+        "full": "_FullInferenceBackend",
+        "approximate": "_ApproximateInferenceBackend",
+        "ukb": "_UKBInferenceBackend",
+    }
+
+    def __init__(self, model, marginal_dist, link_func, regression_terms,
+                 inference_type="full", space_dim=None, random_seed=None,
+                 fewer_voxels=False, dtype=torch.float64, device='cpu'):
+        if inference_type not in self._BACKENDS:
+            valid = ", ".join(sorted(self._BACKENDS))
+            raise ValueError(f"Unknown inference_type={inference_type!r}. Expected one of: {valid}.")
+
+        backend_cls = globals()[self._BACKENDS[inference_type]]
+        backend_kwargs = dict(
+            model=model,
+            marginal_dist=marginal_dist,
+            link_func=link_func,
+            regression_terms=regression_terms,
+            dtype=dtype,
+            device=device,
+        )
+        if inference_type == "full":
+            if space_dim is None or random_seed is None:
+                raise ValueError("space_dim and random_seed are required for full inference.")
+            backend_kwargs.update(
+                space_dim=space_dim,
+                random_seed=random_seed,
+                fewer_voxels=fewer_voxels,
+            )
+
+        self.inference_type = inference_type
+        self._backend = backend_cls(**backend_kwargs)
+
+    def __getattr__(self, name):
+        """Delegate backend-specific attributes for backward compatibility."""
+        return getattr(self._backend, name)
+
+    def load_params(self, data, params):
+        return self._backend.load_params(data=data, params=params)
+
+    def create_contrast(self, contrast_vector=None, contrast_name=None, polynomial_order=None):
+        return self._backend.create_contrast(
+            contrast_vector=contrast_vector,
+            contrast_name=contrast_name,
+            polynomial_order=polynomial_order,
+        )
+
+    def run_inference(self, *args, **kwargs):
+        return self._backend.run_inference(*args, **kwargs)
+
+
+class _BaseInferenceBackend(object):
+    """Shared utilities for concrete inference backends."""
+
+    def __init__(self, model, marginal_dist, link_func, regression_terms,
+                 dtype=torch.float64, device='cpu'):
         self.model = model
-        self.space_dim=space_dim
         self.marginal_dist = marginal_dist
         self.link_func = link_func
         self.regression_terms = regression_terms
-        self.random_seed = random_seed
-        self.fewer_voxels = fewer_voxels
         self.dtype = dtype
         self.device = device
+
+    @staticmethod
+    def _extract_param(params, key):
+        """Return an NPZ/dict parameter value, unwrapping object scalars."""
+        value = params[key]
+        return value.item() if getattr(value, "ndim", 1) == 0 else value
+
+    @staticmethod
+    def _with_intercept(array):
+        """Append an intercept column to a 2D design matrix."""
+        return np.concatenate([array, np.ones((array.shape[0], 1))], axis=1)
+
+    def _scaled_with_intercept(self, array, scale=50.0):
+        """Scale a design matrix by ``scale / n_rows`` and append intercept."""
+        return self._with_intercept(array * scale / array.shape[0])
+
+    @staticmethod
+    def _is_multigroup_data(data):
+        """Return True for the object-array group format used by simulations."""
+        first_value = next(iter(data.values()))
+        return (
+            hasattr(first_value, "ndim")
+            and first_value.ndim == 0
+            and hasattr(first_value, "item")
+            and isinstance(first_value.item(), dict)
+            and {"Y", "Z", "X_spatial"}.issubset(first_value.item())
+        )
+
+    def _normalise_contrast(self, contrast_vector, expected_width):
+        """Validate and L1-normalise contrast rows."""
+        contrast_vector = np.asarray(contrast_vector, dtype=float)
+        if contrast_vector.ndim == 1:
+            contrast_vector = contrast_vector.reshape(1, -1)
+        if contrast_vector.shape[1] != expected_width:
+            raise ValueError(
+                f"Contrast vector shape {contrast_vector.shape} doesn't match "
+                f"expected width ({expected_width})."
+            )
+        row_norm = np.sum(np.abs(contrast_vector), axis=1, keepdims=True)
+        if np.any(row_norm == 0):
+            raise ValueError("Contrast rows must contain at least one non-zero entry.")
+        return contrast_vector / row_norm
+
+    @staticmethod
+    def _default_group_contrast(n_group):
+        """Default contrast for group-level inference."""
+        if n_group == 1:
+            return np.eye(1)
+        contrast = np.zeros((n_group - 1, n_group))
+        for k in range(n_group - 1):
+            contrast[k, k] = 1
+            contrast[k, k + 1] = -1
+        return contrast
+
+    @staticmethod
+    def _default_covariate_contrast(n_covariates, index=0):
+        """Default contrast selecting one covariate column."""
+        contrast = np.zeros((1, n_covariates))
+        contrast[0, index] = 1
+        return contrast
+
+    @staticmethod
+    def _ukb_age_contrast(n_covariates, polynomial_order=1):
+        """Age contrast rows for the UKB covariate layout."""
+        if polynomial_order == 1:
+            contrast = np.zeros((1, n_covariates))
+            contrast[0, 1] = 1
+            return contrast
+
+        contrast = np.zeros((3, n_covariates))
+        contrast[0, 2] = 1
+        contrast[1, 3] = 1
+        contrast[2, 4] = 1
+        return contrast
+
+    def _set_contrast(self, contrast_vector, expected_width, contrast_name=None):
+        """Store a validated, normalised contrast matrix."""
+        self.contrast_name = contrast_name
+        self.contrast_vector = self._normalise_contrast(contrast_vector, expected_width)
+        self._S = self.contrast_vector.shape[0]
+        return self.contrast_vector
+
+    def _set_matrix_dimensions(self, spatial_attr="B", covariate_attr="Z"):
+        """Populate common matrix dimensions from loaded design matrices."""
+        Z = getattr(self, covariate_attr)
+        B = getattr(self, spatial_attr)
+        self._M, self._R = Z.shape
+        self._N, self._P = B.shape
+
+    def _load_flat_design(self, data, *, scale=50.0):
+        """Load flat ``{X_spatial, Z, Y}`` arrays into numpy attributes."""
+        self.group_names = ["Group_1"]
+        self.n_group = 1
+        self.n_subject = {"Group_1": data["Y"].shape[0]}
+        self.B = self._scaled_with_intercept(data["X_spatial"], scale=scale)
+        self.Z = self._scaled_with_intercept(data["Z"], scale=scale)
+        self.Y = data["Y"]
+        self._set_matrix_dimensions()
+
+    def _load_stacked_multigroup_design(self, data, *, scale=50.0):
+        """Load and stack multi-group simulation arrays for approximate inference."""
+        self.group_names = list(data.keys())
+        self.n_group = len(self.group_names)
+        self.n_subject = {}
+
+        first_group = self.group_names[0]
+        X_spatial = data[first_group].item()["X_spatial"]
+        self.B = self._scaled_with_intercept(X_spatial, scale=scale)
+
+        Y_all, Z_all = [], []
+        for group_name in self.group_names:
+            group_data = data[group_name].item()
+            Y_g = group_data["Y"]
+            Z_g = group_data["Z"]
+            self.n_subject[group_name] = Y_g.shape[0]
+            Y_all.append(Y_g)
+            Z_all.append(Z_g)
+
+        Z_cat = np.concatenate(Z_all, axis=0)
+        self.Z = self._scaled_with_intercept(Z_cat, scale=scale)
+        self.Y = np.concatenate(Y_all, axis=0)
+        self._set_matrix_dimensions()
+
+    def _load_shared_beta(self, params, *, reject_dict=False):
+        """Load a shared beta parameter from params."""
+        beta = self._extract_param(params, "beta")
+        if reject_dict and isinstance(beta, dict):
+            raise NotImplementedError(
+                "This inference backend does not support per-group beta dict. "
+                "Use full-model inference or provide a shared beta array."
+            )
+        self.beta = beta
+        return beta
+
+    def _load_probability_mean(self, params, group_names):
+        """Load fitted probabilities and store their voxel-wise mean."""
+        P_value = self._extract_param(params, "P")
+        if isinstance(P_value, dict):
+            self.P_mean = np.stack(
+                [np.mean(P_value[group], axis=0) for group in group_names], axis=0,
+            )
+        else:
+            self.P_mean = np.mean(P_value, axis=0, keepdims=True)
+        self.eta = np.log(self.P_mean)
+        return self.P_mean
+
+    def _load_group_or_shared_beta(self, params, group_names, *, as_tensor=False):
+        """Load beta as per-group or shared parameters and compatibility attrs."""
+        beta_value = self._extract_param(params, "beta")
+        if isinstance(beta_value, dict):
+            if as_tensor:
+                self.beta_dict = {g: torch.tensor(beta_value[g], **self._kwargs) for g in group_names}
+            else:
+                self.beta_dict = {g: beta_value[g] for g in group_names}
+            self.beta_array_dict = {g: beta_value[g] for g in group_names}
+            first = group_names[0]
+            self.beta = self.beta_dict[first]
+            self.beta_array = self.beta_array_dict[first]
+        else:
+            self.beta = torch.tensor(beta_value, **self._kwargs) if as_tensor else beta_value
+            self.beta_array = beta_value
+            self.beta_dict = {g: self.beta for g in group_names}
+            self.beta_array_dict = {g: self.beta_array for g in group_names}
+        return self.beta
+
+    def _compute_mu_matrix(self, Z, B, beta, *, block_size=1000):
+        """Compute fitted means and reshape them to ``(n_subject, n_voxel)``."""
+        mu = compute_mu(Z, B, beta, mode="dask", block_size=block_size)
+        return mu.reshape(Z.shape[0], B.shape[0])
+
+    def _save_npz(self, filename, **arrays):
+        """Save arrays to an NPZ file, creating the parent directory if needed."""
+        if filename is None:
+            return
+        parent = os.path.dirname(filename)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        np.savez(filename, **arrays)
+
+    def _load_or_compute_array(self, filename, key, compute_fn,
+                               *, allow_pickle=False, load_message=None,
+                               compute_message=None):
+        """Shared cache helper for one-array NPZ files."""
+        if filename is not None and os.path.exists(filename):
+            if load_message:
+                print(load_message)
+            return np.load(filename, allow_pickle=allow_pickle)[key]
+        if compute_message:
+            print(compute_message)
+        value = compute_fn()
+        if filename is not None:
+            self._save_npz(filename, **{key: value})
+        return value
+
+    def _load_or_compute_npz_dict(self, filename, compute_fn, *, allow_pickle=False):
+        """Shared cache helper for multi-array NPZ files."""
+        if filename is not None and os.path.exists(filename):
+            loaded = np.load(filename, allow_pickle=allow_pickle)
+            return {key: loaded[key] for key in loaded.files}
+        result = compute_fn()
+        if filename is not None:
+            self._save_npz(filename, **result)
+        return result
+
+    def _load_or_compute_inference(self, compute_fn, *, inference_filename=None,
+                                   p_vals_filename=None, z_vals_filename=None,
+                                   log_prefix="INFERENCE"):
+        """Shared cache handling for inference outputs."""
+        if inference_filename is not None and os.path.exists(inference_filename):
+            print(f"[{log_prefix}] LOADING CACHED inference from {inference_filename}")
+            loaded = np.load(inference_filename)
+            return loaded["p_vals"], loaded["z_stats"]
+
+        if (
+            p_vals_filename is not None
+            and z_vals_filename is not None
+            and os.path.exists(p_vals_filename)
+            and os.path.exists(z_vals_filename)
+        ):
+            print(f"[{log_prefix}] loaded p-values and z-stats from file.")
+            return np.load(p_vals_filename)["p_vals"], np.load(z_vals_filename)["z_stats"]
+
+        if inference_filename is not None:
+            print(f"[{log_prefix}] Computing fresh inference → {inference_filename}")
+        p_vals, z_stats = compute_fn()
+        if inference_filename is not None:
+            self._save_npz(inference_filename, p_vals=p_vals, z_stats=z_stats)
+        if p_vals_filename is not None:
+            self._save_npz(p_vals_filename, p_vals=p_vals)
+        if z_vals_filename is not None:
+            self._save_npz(z_vals_filename, z_stats=z_stats)
+        return p_vals, z_stats
+
+    def _log_inference_summary(self, p_vals, z_stats, *, alpha=0.05, two_sided=True):
+        """Print a compact summary of inference results."""
+        print(f"[INFERENCE] z_stats: min={z_stats.min():.4f}, max={z_stats.max():.4f}, "
+              f"mean={z_stats.mean():.4f}, std={np.std(z_stats):.4f}")
+        if two_sided:
+            significant = np.count_nonzero(2.0 * scipy.stats.norm.sf(np.abs(z_stats)) < alpha)
+            print(f"[INFERENCE] significant (two-sided, alpha={alpha}): {significant}/{z_stats.size}")
+        else:
+            print(f"[INFERENCE] significant (alpha={alpha}): {np.count_nonzero(p_vals < alpha)}/{p_vals.size}")
+        logger.info("p_vals shape: %s", p_vals.shape)
+
+    def _plot_brain_z_maps(self, z_stats, fig_filename, lesion_mask, *, alpha=0.05,
+                           suffix_multiple=True, output_uncorrected=False):
+        """Shared z-statistic brain-map plotting."""
+        if fig_filename is None or lesion_mask is None:
+            return
+        parent = os.path.dirname(fig_filename)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        z_threshold = scipy.stats.norm.ppf(1 - alpha)
+        print("threshold", z_threshold)
+        if z_stats.ndim == 2 and z_stats.shape[0] > 1 and suffix_multiple:
+            for i in range(z_stats.shape[0]):
+                out_fname = fig_filename.replace(".png", f"_contrast_{i}.png")
+                plot_brain(p=z_stats[i], brain_mask=lesion_mask, threshold=z_threshold, output_filename=out_fname)
+        else:
+            output_filename = fig_filename.replace(".png", "_uncorrected.png") if output_uncorrected else fig_filename
+            plot_brain(p=z_stats.ravel(), brain_mask=lesion_mask, threshold=z_threshold, vmax=None, output_filename=output_filename)
+
+    def _save_brain_outputs(self, p_vals, z_stats, lesion_mask, fig_dir, method):
+        """Save p-value and z-statistic NIfTI maps."""
+        if lesion_mask is None or fig_dir is None:
+            return
+        os.makedirs(fig_dir, exist_ok=True)
+        save_nifti(p_vals.flatten(), lesion_mask, os.path.join(fig_dir, f"p_vals_{self.model}_{method}.nii.gz"))
+        save_nifti(z_stats.flatten(), lesion_mask, os.path.join(fig_dir, f"z_stats_{self.model}_{method}.nii.gz"))
+
+    def poisson_sandwich_kron(self,
+                              Z,
+                              B,
+                              y,
+                              mu,
+                              *,
+                              meat="cluster",
+                              ridge=0.0,
+                              bread_weights=None,
+                              score_residuals=None,
+                              mu_for_meat=None,
+                              correction=None,
+                              return_diagnostics=False):
+        """Memory-efficient sandwich covariance for Kronecker-design GLMs."""
+        Z = np.asarray(Z, dtype=float)
+        B = np.asarray(B, dtype=float)
+        y = np.asarray(y, dtype=float)
+        mu = np.asarray(mu, dtype=float)
+
+        M, R = Z.shape
+        N, P = B.shape
+        p = R * P
+
+        if y.shape != (M, N) or mu.shape != (M, N):
+            raise ValueError("y and mu must have shape (M, N) matching Z and B.")
+        if not np.isfinite(Z).all() or not np.isfinite(B).all() or not np.isfinite(y).all():
+            raise ValueError("Inputs Z/B/y contain NaN or Inf.")
+
+        mu = np.nan_to_num(mu, nan=0.0, posinf=1e12, neginf=0.0)
+        mu = np.clip(mu, 1e-12, 1e12)
+
+        if bread_weights is None:
+            bread_weights = mu
+        else:
+            bread_weights = np.asarray(bread_weights, dtype=float)
+            bread_weights = np.nan_to_num(bread_weights, nan=0.0, posinf=1e12, neginf=0.0)
+            bread_weights = np.clip(bread_weights, 1e-12, 1e12)
+
+        if score_residuals is not None:
+            r = np.asarray(score_residuals, dtype=float)
+        elif mu_for_meat is not None:
+            mu_r = np.asarray(mu_for_meat, dtype=float)
+            mu_r = np.nan_to_num(mu_r, nan=0.0, posinf=1e12, neginf=0.0)
+            mu_r = np.clip(mu_r, 1e-12, 1e12)
+            r = y - mu_r
+        else:
+            r = y - mu
+        r = np.nan_to_num(r, nan=0.0, posinf=0.0, neginf=0.0)
+
+        w_bread = np.einsum('ik,il,ij->klj', Z, Z, bread_weights)
+        A = np.zeros((p, p))
+        for k in range(R):
+            for k2 in range(k, R):
+                block = B.T @ (B * w_bread[k, k2, :, None])
+                A[k * P:(k + 1) * P, k2 * P:(k2 + 1) * P] = block
+                if k != k2:
+                    A[k2 * P:(k2 + 1) * P, k * P:(k + 1) * P] = block
+
+        if ridge > 0:
+            A += ridge * np.eye(p)
+
+        A = np.nan_to_num(A, nan=0.0, posinf=1e12, neginf=-1e12)
+        A = 0.5 * (A + A.T)
+
+        hc_factor = self._apply_sandwich_correction(
+            correction, A, Z, B, bread_weights, r, ridge, M, R, P, p
+        )
+        if isinstance(hc_factor, tuple):
+            hc_factor, r = hc_factor
+
+        C, Bmeat, meat_kind = self._sandwich_meat(Z, B, r, meat, M, R, P, p)
+
+        try:
+            ridge_eps = max(ridge, 1e-8)
+            L, low = scipy.linalg.cho_factor(A + ridge_eps * np.eye(p))
+            if meat_kind == "cluster":
+                Y = scipy.linalg.cho_solve((L, low), C)
+                cov = Y @ Y.T
+            else:
+                D = scipy.linalg.cho_solve((L, low), Bmeat)
+                cov = scipy.linalg.cho_solve((L, low), D.T).T
+        except (np.linalg.LinAlgError, ValueError):
+            logger.warning("Cholesky failed — falling back to pseudo-inverse")
+            Ainv = np.linalg.pinv(A + 1e-6 * np.eye(p))
+            if meat_kind == "cluster":
+                Y = Ainv @ C
+                cov = Y @ Y.T
+            else:
+                cov = Ainv @ np.nan_to_num(Bmeat, nan=0.0, posinf=1e12, neginf=-1e12) @ Ainv
+
+        cov *= hc_factor
+        cov = 0.5 * (cov + cov.T)
+
+        if return_diagnostics:
+            return cov, {
+                "method": "kron_sandwich",
+                "meat": meat_kind,
+                "ridge": ridge,
+                "correction": correction,
+                "M": M,
+                "N": N,
+                "R": R,
+                "P": P,
+                "p": p,
+            }
+        return cov
+
+    def _apply_sandwich_correction(self, correction, A, Z, B, bread_weights, r, ridge, M, R, P, p):
+        if correction is None:
+            return 1.0
+
+        correction_kind = correction.lower()
+        if correction_kind == "hc0":
+            return 1.0
+        if correction_kind == "hc1":
+            if M <= R:
+                raise ValueError(
+                    f"HC1 correction requires M > R, got M={M}, R={R}. "
+                    "Use correction='hc0' for this setting."
+                )
+            hc_factor = M / float(M - R)
+            logger.info("Applying HC1 sandwich meat correction: M/(M-R)=%.6g", hc_factor)
+            return hc_factor
+        if correction_kind != "hc3":
+            raise ValueError("correction must be None, 'hc0', 'hc1', or 'hc3'.")
+
+        ridge_eps = max(ridge, 1e-8)
+        try:
+            L_h, low_h = scipy.linalg.cho_factor(A + ridge_eps * np.eye(p))
+            Ainv_for_h = scipy.linalg.cho_solve((L_h, low_h), np.eye(p))
+        except (np.linalg.LinAlgError, ValueError):
+            logger.warning("Cholesky failed while computing HC3 leverage — using pseudo-inverse")
+            Ainv_for_h = np.linalg.pinv(A + 1e-6 * np.eye(p))
+
+        Ainv_blocks = Ainv_for_h.reshape(R, P, R, P).transpose(0, 2, 1, 3)
+        leverage_basis = np.einsum('jp,klpq,jq->klj', B, Ainv_blocks, B)
+        hii = bread_weights * np.einsum('ik,il,klj->ij', Z, Z, leverage_basis)
+        hii = np.nan_to_num(hii, nan=0.0, posinf=1.0, neginf=0.0)
+        hii = np.clip(hii, 0.0, 0.999)
+        r = r / np.maximum(1.0 - hii, 1e-6)
+        logger.info(
+            "Applying HC3 sandwich correction: leverage min/mean/max = %.4g / %.4g / %.4g",
+            float(np.min(hii)), float(np.mean(hii)), float(np.max(hii)),
+        )
+        return 1.0, r
+
+    def _sandwich_meat(self, Z, B, r, meat, M, R, P, p):
+        meat_kind = meat.lower()
+        if meat_kind == "cluster":
+            Bt_r = B.T @ r.T
+            C = np.zeros((p, M))
+            for k in range(R):
+                C[k * P:(k + 1) * P, :] = Bt_r * Z[:, k][None, :]
+            return C, None, meat_kind
+        if meat_kind == "iid":
+            w_meat = np.einsum('ik,il,ij->klj', Z, Z, r ** 2)
+            Bmeat = np.zeros((p, p))
+            for k in range(R):
+                for k2 in range(k, R):
+                    block = B.T @ (B * w_meat[k, k2, :, None])
+                    Bmeat[k * P:(k + 1) * P, k2 * P:(k2 + 1) * P] = block
+                    if k != k2:
+                        Bmeat[k2 * P:(k2 + 1) * P, k * P:(k + 1) * P] = block
+            return None, Bmeat, meat_kind
+        raise ValueError("meat must be 'iid' or 'cluster'.")
+
+    def compute_fisher_information(self, Z, B, mu, *, use_dask=True,
+                                   block_size=1e4, cache_filename=None,
+                                   cache_key="XTWX"):
+        """Compute or load ``X.T @ W @ X`` for the Kronecker design."""
+        if cache_filename is not None and os.path.exists(cache_filename):
+            return np.load(cache_filename)[cache_key]
+
+        fisher_info = efficient_kronT_diag_kron(
+            Z, B, mu, use_dask=use_dask, block_size=block_size,
+        )
+        if cache_filename is not None:
+            os.makedirs(os.path.dirname(cache_filename), exist_ok=True)
+            np.savez(cache_filename, **{cache_key: fisher_info})
+        return fisher_info
+
+    def fisher_covariance(self, fisher_info, *, ridge=1e-6, inverse="pinv"):
+        """Invert a Fisher-information matrix with a small ridge term."""
+        fisher_info = np.asarray(fisher_info, dtype=float)
+        regularized = fisher_info + ridge * np.eye(fisher_info.shape[0])
+        if inverse == "inv":
+            return np.linalg.inv(regularized)
+        if inverse == "pinv":
+            return np.linalg.pinv(regularized)
+        raise ValueError("inverse must be 'inv' or 'pinv'.")
+
+    def blockwise_fisher_covariance(self, fisher_info, n_blocks, block_size,
+                                    *, ridge=1e-6):
+        """Return block-diagonal covariance blocks from a Fisher matrix."""
+        return [
+            robust_inverse(
+                fisher_info[i * block_size:(i + 1) * block_size,
+                            i * block_size:(i + 1) * block_size]
+                + ridge * np.eye(block_size)
+            )
+            for i in range(n_blocks)
+        ]
+
+    def autograd_hessian_covariance(self, hessian, n_covariates, n_bases,
+                                    *, ridge=1e-6):
+        """Convert an autograd Hessian ``(P, R, P, R)`` to covariance."""
+        fisher_full = hessian.transpose(1, 0, 3, 2).reshape(
+            n_covariates * n_bases,
+            n_covariates * n_bases,
+        )
+        return self.fisher_covariance(fisher_full, ridge=ridge, inverse="inv")
+
+    def sandwich_covariance(self, Z, B, Y, mu, *, meat="cluster", ridge=0.0,
+                            mu_for_meat=None, bread_weights=None,
+                            score_residuals=None, correction=None,
+                            return_diagnostics=False):
+        """Compute sandwich covariance through the shared Kronecker routine."""
+        return self.poisson_sandwich_kron(
+            Z, B, Y, mu,
+            meat=meat,
+            ridge=ridge,
+            bread_weights=bread_weights,
+            score_residuals=score_residuals,
+            mu_for_meat=mu_for_meat,
+            correction=correction,
+            return_diagnostics=return_diagnostics,
+        )
+
+    def contrast_design(self, contrast_vector, B):
+        """Build flattened ``C ⊗ B`` rows for all contrasts and voxels."""
+        contrast_vector = np.asarray(contrast_vector)
+        CB = np.einsum('ij,kl->ikjl', contrast_vector, B)
+        return CB.reshape(contrast_vector.shape[0], B.shape[0], -1)
+
+    def full_covariance_contrast_variance(self, contrast_design, covariance,
+                                          *, keepdims=False):
+        """Compute ``diag((C⊗B) Cov(beta) (C⊗B)^T)`` per voxel."""
+        tmp = np.einsum('snk,kl->snl', contrast_design, covariance)
+        return np.sum(tmp * contrast_design, axis=-1, keepdims=keepdims)
+
+    def blockwise_contrast_variance(self, B, contrast_vector, cov_blocks):
+        """Contrast variance when covariance is approximated by covariate blocks."""
+        var_eta = []
+        for cov_block in cov_blocks:
+            var_eta.append(np.einsum('ij,jk,ik->i', B, cov_block, B))
+        var_eta = np.stack(var_eta, axis=0)
+        return np.asarray(contrast_vector) ** 2 @ var_eta
+
+    def mass_univariate_fisher_covariance(self, Z, beta):
+        """Per-voxel Fisher covariance for mass-univariate GLMs."""
+        beta = np.asarray(beta)
+        if beta.ndim == 2 and beta.shape[1] == Z.shape[1]:
+            linear = Z @ beta.T
+        elif beta.shape[0] == Z.shape[1]:
+            linear = Z @ beta
+        else:
+            raise ValueError(
+                f"Cannot align beta shape {beta.shape} with Z shape {Z.shape}."
+            )
+
+        if self.link_func == "log":
+            mu = np.exp(linear)
+            fisher_info = np.einsum('im,ij,ik->jmk', Z, mu, Z)
+        elif self.link_func == "logit":
+            mu = 1.0 / (1.0 + np.exp(-linear))
+            fisher_info = np.einsum('im,ij,ik->jmk', Z, mu * (1.0 - mu), Z)
+        else:
+            raise ValueError(f"Link function {self.link_func} not supported.")
+
+        return np.linalg.pinv(fisher_info), mu
+
+    def plot_1d(self, p_vals, filename, significance_level=0.05):
+        p_vals = np.atleast_2d(p_vals)
+        n_panels, n_voxel = p_vals.shape
+        fig, axes = plt.subplots(1, n_panels, figsize=(11.5 * n_panels, 11), squeeze=False)
+        axes = axes.ravel()
+
+        th_p = np.arange(1 / float(n_voxel), 1 + 1 / float(n_voxel), 1 / float(n_voxel))
+        th_p_log = -np.log10(th_p)
+        k_array = np.arange(start=1, stop=n_voxel + 1, step=1)
+        ci_lower = scipy.stats.beta.ppf(significance_level / 2, k_array, n_voxel - k_array + 1)
+        ci_upper = scipy.stats.beta.ppf(1 - significance_level / 2, k_array, n_voxel - k_array + 1)
+
+        for i, ax in enumerate(axes):
+            sorted_p_vals = np.sort(p_vals[i, :])
+            significance_percentage = np.sum(sorted_p_vals < significance_level) / n_voxel
+            ax.fill_between(
+                th_p_log,
+                -np.log10(ci_lower),
+                -np.log10(ci_upper),
+                color='grey',
+                alpha=0.5,
+                label=f'{int((1 - significance_level) * 100)}% Beta CI',
+            )
+            ax.plot(th_p_log, np.repeat(-np.log10(significance_level), n_voxel), color='y', linestyle='--', label=f'threshold at -log10({significance_level})')
+            ax.plot(th_p_log, -np.log10(th_p), color='orange', linestyle='--', label='y=x')
+            ax.plot(th_p_log, -np.log10(significance_level * th_p), color='red', linestyle='-', label='FDR(BH) control')
+            ax.scatter(th_p_log, -np.log10(sorted_p_vals), c='#1f77b4', s=4)
+            ax.set_xlim([0, np.max(-np.log10(k_array / n_voxel))])
+            ax.set_ylim([0, np.max(-np.log10(k_array / n_voxel))])
+            ax.set_xlabel("Expected -log10(P)", fontsize=20)
+            ax.set_ylabel("Observed -log10(P)", fontsize=20)
+            ax.set_title(f"Contrast {i}: {significance_percentage * 100:.2f}% voxels rejected", fontsize=24)
+            ax.legend()
+
+        fig.savefig(filename)
+        plt.close(fig)
+
+    def histogram_z_stats(self, z_stats, filename):
+        plt.figure(figsize=(10, 6))
+        plt.hist(np.asarray(z_stats).ravel(), bins=100, color='blue', alpha=0.7, edgecolor='black')
+        plt.title('Histogram of Z-statistics', fontsize=16)
+        plt.xlabel('Z-statistic', fontsize=14)
+        plt.ylabel('Frequency', fontsize=14)
+        plt.grid(axis='y', alpha=0.75)
+        plt.savefig(filename)
+        plt.close()
+
+class _FullInferenceBackend(_BaseInferenceBackend):
+    def __init__(self, model,space_dim, marginal_dist, link_func, regression_terms, random_seed, fewer_voxels=False,
+                dtype=torch.float64, device='cpu'):
+        super().__init__(model, marginal_dist, link_func, regression_terms, dtype=dtype, device=device)
+        self.space_dim=space_dim
+        self.random_seed = random_seed
+        self.fewer_voxels = fewer_voxels
         self._kwargs = {"device": self.device, "dtype": self.dtype}
     
     def load_params(self, data, params):
@@ -46,9 +703,7 @@ class BrainInference_full(object):
         # X_spatial is shared across groups — use the first group's
         first_group = self.group_names[0]
         X_spatial = data[first_group].item()["X_spatial"]
-        self.X_spatial_array = np.concatenate(
-            [X_spatial, np.ones((X_spatial.shape[0], 1))], axis=1,
-        )
+        self.X_spatial_array = self._with_intercept(X_spatial)
         self.X_spatial = torch.tensor(self.X_spatial_array, **self._kwargs)
 
         # Per-group data
@@ -60,95 +715,32 @@ class BrainInference_full(object):
             group_data = data[group_name].item()
             Y_g = group_data["Y"]
             Z_g = group_data["Z"]
-            intercept_col = np.ones((Z_g.shape[0], 1))
-            Z_with_intercept = np.concatenate([Z_g, intercept_col], axis=1)
+            Z_with_intercept = self._with_intercept(Z_g)
             self.Y[group_name] = torch.tensor(Y_g, **self._kwargs)
             self.Z[group_name] = torch.tensor(Z_with_intercept, **self._kwargs)
             self.n_subject[group_name] = Z_with_intercept.shape[0]
             self.n_covariates[group_name] = Z_with_intercept.shape[1]
 
-        # P from params (0-d object array wrapping dict)
-        P_raw = params["P"]
-        P_dict = P_raw.item() if P_raw.ndim == 0 else P_raw
-        if isinstance(P_dict, dict):
-            self.P_mean = np.stack(
-                [np.mean(P_dict[g], axis=0) for g in self.group_names], axis=0,
-            )  # (n_group, n_voxel)
-        else:
-            self.P_mean = np.mean(P_dict, axis=0, keepdims=True)
-        self.eta = np.log(self.P_mean)
-
-        # beta and spatial dimensions
-        beta_raw = params["beta"]
-        beta_val = beta_raw.item() if beta_raw.ndim == 0 else beta_raw
-        if isinstance(beta_val, dict):
-            # Per-group betas: dict {group_name: (n_bases, n_covariates)}
-            self.beta_dict = {g: torch.tensor(beta_val[g], **self._kwargs) for g in self.group_names}
-            self.beta_array_dict = {g: beta_val[g] for g in self.group_names}
-            # For backward compat, set self.beta / beta_array to first group's
-            first = self.group_names[0]
-            self.beta = self.beta_dict[first]
-            self.beta_array = self.beta_array_dict[first]
-        else:
-            # Single shared beta (single-group or legacy)
-            self.beta = torch.tensor(beta_val, **self._kwargs)
-            self.beta_array = beta_val
-            self.beta_dict = {g: self.beta for g in self.group_names}
-            self.beta_array_dict = {g: self.beta_array for g in self.group_names}
+        self._load_probability_mean(params, self.group_names)
+        self._load_group_or_shared_beta(params, self.group_names, as_tensor=True)
         self.n_voxel, self.n_bases = self.X_spatial.shape
 
-    def create_contrast(self, contrast_vector=None, contrast_name=None):
+    def create_contrast(self, contrast_vector=None, contrast_name=None, polynomial_order=None):
         """Build and normalise the contrast vector over groups."""
-        self.contrast_name = contrast_name
         if contrast_vector is None:
-            if self.n_group == 1:
-                # Single group: trivial identity contrast (unused in MUM path)
-                self.contrast_vector = np.eye(1)
-            else:
-                # Default: consecutive pairwise differences c_g - c_{g+1}.
-                # For 2 groups this is [[1, -1]], which tests the group difference
-                # rather than each group's absolute effect.
-                c = np.zeros((self.n_group - 1, self.n_group))
-                for k in range(self.n_group - 1):
-                    c[k, k] = 1
-                    c[k, k + 1] = -1
-                self.contrast_vector = c
+            contrast_vector = self._default_group_contrast(self.n_group)
         else:
-            self.contrast_vector = np.array(contrast_vector).reshape(1, -1)
-        if self.contrast_vector.shape[1] != self.n_group:
-            raise ValueError(
-                f"Contrast vector shape {self.contrast_vector.shape} "
-                f"doesn't match number of groups ({self.n_group})."
-            )
-        # standardization (row sum 1)
-        self.contrast_vector = self.contrast_vector / np.sum(np.abs(self.contrast_vector), axis=1).reshape((-1, 1))
+            contrast_vector = np.array(contrast_vector).reshape(1, -1)
+        self._set_contrast(contrast_vector, self.n_group, contrast_name)
 
     def run_inference(self, method="FI", inference_filename=None, fig_filename=None, lesion_mask=None, alpha=0.05):
-        z_threshold = scipy.stats.norm.ppf(1-alpha)
-        if not os.path.exists(inference_filename):
-            print(f"[INFERENCE] Computing fresh inference → {inference_filename}")
-            p_vals, z_stats = self._glh_con_group(method)
-            np.savez(inference_filename, p_vals=p_vals, z_stats=z_stats)
-        else:
-            print(f"[INFERENCE] LOADING CACHED inference from {inference_filename}")
-            loaded = np.load(inference_filename)
-            p_vals = loaded["p_vals"]
-            z_stats = loaded["z_stats"]
-        print(f"[INFERENCE] z_stats: min={z_stats.min():.4f}, max={z_stats.max():.4f}, "
-              f"mean={z_stats.mean():.4f}, std={np.std(z_stats):.4f}")
-        print(f"[INFERENCE] significant (two-sided, alpha=0.05): "
-              f"{np.count_nonzero(2.0 * scipy.stats.norm.sf(np.abs(z_stats)) < 0.05)}/{z_stats.size}")
-        logger.info("p_vals shape: %s", p_vals.shape)
+        p_vals, z_stats = self._load_or_compute_inference(
+            lambda: self._glh_con_group(method),
+            inference_filename=inference_filename,
+        )
+        self._log_inference_summary(p_vals, z_stats, alpha=alpha, two_sided=True)
         logger.info("Plotting inference results to %s", fig_filename)
-        os.makedirs(os.path.dirname(fig_filename), exist_ok=True)
-        print("threshold", z_threshold)
-        if z_stats.ndim == 2 and z_stats.shape[0] > 1:
-            for i in range(z_stats.shape[0]):
-                suffix = f"_contrast_{i}"
-                out_fname = fig_filename.replace(".png", f"{suffix}.png")
-                plot_brain(p=z_stats[i], brain_mask=lesion_mask, threshold=z_threshold, output_filename=out_fname)
-        else:
-            plot_brain(p=z_stats.ravel(), brain_mask=lesion_mask, threshold=z_threshold, output_filename=fig_filename)
+        self._plot_brain_z_maps(z_stats, fig_filename, lesion_mask, alpha=alpha)
 
     def _glh_con_group(self, method, batch_size=20):
         """Dispatch to model-specific inference method."""
@@ -174,18 +766,7 @@ class BrainInference_full(object):
         Z_np = np.concatenate(Z_all, axis=0)  # (M_total, n_covariates)
         Y_np = np.concatenate(Y_all, axis=0)  # (M_total, n_voxels)
 
-        if self.link_func == "log":
-            MU = np.exp(Z_np @ self.beta_array.T)  # (M_total, n_voxels)
-            # FI per voxel: F_j = Z^T diag(mu_j) Z, shape (n_voxels, R, R)
-            FI = np.einsum('im,ij,ik->jmk', Z_np, MU, Z_np)
-        elif self.link_func == "logit":
-            linear = Z_np @ self.beta_array.T
-            MU = 1.0 / (1.0 + np.exp(-linear))
-            FI = np.einsum('im,ij,ik->jmk', Z_np, MU * (1.0 - MU), Z_np)
-        else:
-            raise ValueError(f"Link function {self.link_func} not supported.")
-
-        Cov_beta = np.linalg.pinv(FI)  # (n_voxels, R, R)
+        Cov_beta, _ = self.mass_univariate_fisher_covariance(Z_np, self.beta_array)
 
         # Numerator: contrast @ beta_j for each voxel
         # beta_array: (n_voxels, n_covariates), contrast_vector: (n_contrast, n_group)
@@ -286,9 +867,9 @@ class BrainInference_full(object):
                 F_beta = all_F_beta[group]  # shape (P, R, P, R) from autograd Hessian
                 n_cov = self.n_covariates[group]
                 P_dim = self.n_bases
-                # Reorder to (R*P, R*P): F[p1,r1,p2,r2] -> full[r1*P+p1, r2*P+p2]
-                F_full = F_beta.transpose(1, 0, 3, 2).reshape(n_cov * P_dim, n_cov * P_dim)
-                all_cov_beta[group] = np.linalg.inv(F_full + 1e-6 * np.eye(n_cov * P_dim))
+                all_cov_beta[group] = self.autograd_hessian_covariance(
+                    F_beta, n_cov, P_dim, ridge=1e-6,
+                )
                 del F_beta
             del all_F_beta
         elif method == "sandwich":
@@ -310,7 +891,7 @@ class BrainInference_full(object):
                     score_r = Y_np - mu_group
                 else:
                     raise ValueError(f"Sandwich not implemented for {self.marginal_dist}")
-                cov_full = self.poisson_sandwich_kron(
+                cov_full = self.sandwich_covariance(
                     Z_np, self.X_spatial_array, Y_np, mu_group, meat="cluster",
                     bread_weights=bread_w, score_residuals=score_r,
                 )
@@ -386,11 +967,8 @@ class BrainInference_full(object):
             f"{os.getcwd()}/results/{self.space_dim}/GRF_{n_subject_list}/"
             f"{self.model}_{self.marginal_dist}_{self.link_func}/Fisher_info_{self.random_seed}.npz"
         )
-        os.makedirs(os.path.dirname(Fisher_info_filename), exist_ok=True)
-        if os.path.exists(Fisher_info_filename):
-            loaded = np.load(Fisher_info_filename, allow_pickle=True)
-            all_H = {group: loaded[group] for group in loaded.files}
-        else:
+
+        def compute_hessians():
             start_time = time.time()
             all_H = {}
             for group in self.group_names:
@@ -410,107 +988,12 @@ class BrainInference_full(object):
                     H = torch.autograd.functional.hessian(nll, beta_age, create_graph=False)
                 all_H[group] = H.detach().cpu().numpy()
             logger.info("Fisher information computed in %.1fs", time.time() - start_time)
-            np.savez(Fisher_info_filename, **all_H)
-        return all_H
+            return all_H
 
-    def poisson_sandwich_kron(self, Z, B, y, mu, *, meat="cluster", ridge=0.0,
-                               bread_weights=None, score_residuals=None):
-        """Memory-efficient sandwich covariance for GLM with log link.
+        return self._load_or_compute_npz_dict(
+            Fisher_info_filename, compute_hessians, allow_pickle=True,
+        )
 
-        Exploits X[i,j,:] = kron(Z[i,:], B[j,:]) without materialising
-        the full design matrix.
-
-        Parameters
-        ----------
-        Z : (M, R) subject covariates
-        B : (N, P) spatial bases
-        y : (M, N) observed outcomes
-        mu : (M, N) fitted mean (must be > 0)
-        meat : 'cluster' or 'iid'
-        ridge : ridge penalty added to bread
-        bread_weights : (M, N) or None
-            Custom weights for the bread (Fisher info).  Defaults to mu
-            (Poisson).  For NB: r*mu/(r+mu).
-        score_residuals : (M, N) or None
-            Custom score contributions for the meat.  Defaults to y - mu
-            (Poisson).  For NB: r*(y-mu)/(r+mu).
-
-        Returns
-        -------
-        cov : (R*P, R*P) sandwich covariance of vec(beta)
-        """
-        Z = np.asarray(Z, dtype=float)
-        B = np.asarray(B, dtype=float)
-        y = np.asarray(y, dtype=float)
-        mu = np.asarray(mu, dtype=float)
-
-        M, R = Z.shape
-        N, P = B.shape
-        p = R * P
-
-        if bread_weights is None:
-            bread_weights = mu  # Poisson default
-        if score_residuals is None:
-            score_residuals = y - mu  # Poisson default
-
-        r = score_residuals  # (M, N)
-
-        # Bread: A (p x p)
-        w_bread = np.einsum('ik,il,ij->klj', Z, Z, bread_weights)  # (R, R, N)
-        A = np.zeros((p, p))
-        for k in range(R):
-            for k2 in range(k, R):
-                block = B.T @ (B * w_bread[k, k2, :, None])  # (P, P)
-                A[k * P:(k + 1) * P, k2 * P:(k2 + 1) * P] = block
-                if k != k2:
-                    A[k2 * P:(k2 + 1) * P, k * P:(k + 1) * P] = block
-
-        if ridge > 0:
-            A += ridge * np.eye(p)
-
-        # Meat
-        meat_kind = meat.lower()
-        if meat_kind == "cluster":
-            Bt_r = B.T @ r.T  # (P, M)
-            U = np.zeros((p, M))
-            for k in range(R):
-                U[k * P:(k + 1) * P, :] = Bt_r * Z[:, k][None, :]
-            C = U
-            Bmeat = None
-        elif meat_kind == "iid":
-            w_meat = np.einsum('ik,il,ij->klj', Z, Z, r ** 2)  # (R, R, N)
-            Bmeat = np.zeros((p, p))
-            for k in range(R):
-                for k2 in range(k, R):
-                    block = B.T @ (B * w_meat[k, k2, :, None])
-                    Bmeat[k * P:(k + 1) * P, k2 * P:(k2 + 1) * P] = block
-                    if k != k2:
-                        Bmeat[k2 * P:(k2 + 1) * P, k * P:(k + 1) * P] = block
-            C = None
-        else:
-            raise ValueError("meat must be 'iid' or 'cluster'.")
-
-        # Solve: cov = A^{-1} meat A^{-1}
-        try:
-            L, low = scipy.linalg.cho_factor(A)
-            if meat_kind == "cluster":
-                Y = scipy.linalg.cho_solve((L, low), C)  # (p, M)
-                cov = Y @ Y.T
-            else:
-                D = scipy.linalg.cho_solve((L, low), Bmeat)
-                cov = scipy.linalg.cho_solve((L, low), D.T).T
-        except np.linalg.LinAlgError:
-            logger.warning("Cholesky failed — falling back to pseudo-inverse")
-            Ainv = np.linalg.pinv(A)
-            if meat_kind == "cluster":
-                Y = Ainv @ C
-                cov = Y @ Y.T
-            else:
-                cov = Ainv @ Bmeat @ Ainv
-
-        cov = 0.5 * (cov + cov.T)
-        return cov
-    
     def batch_compute_covariance(self, var_P, Z, X, P, cov_beta_w, batch_size=20):
         n_subject = Z.shape[0]
         split_indices = np.arange(0, n_subject, batch_size)
@@ -540,148 +1023,40 @@ class BrainInference_full(object):
         
         return var_P
     
-    def plot_1d(self, p_vals, filename, significance_level=0.05):
-        # slice list
-        fig, axes = plt.subplots(1, 2, figsize=(23, 11))
-
-        # Subplot 3
-        M, N = p_vals.shape
-        # theoretical p-values 
-        th_p = np.arange(1/float(N),1+1/float(N),1/float(N)) # shape: (n_voxel,)
-        th_p_log = -np.log10(th_p)
-        # kth order statistics
-        k_array = np.arange(start=1, stop=N+1, step=1)
-        # empirical confidence interval (estimated from p-values)
-        z_1, z_2 = scipy.stats.norm.ppf(significance_level), scipy.stats.norm.ppf(1-significance_level)
-        # Add the Beta confidence interval
-        CI_lower = scipy.stats.beta.ppf(significance_level/2, k_array, N - k_array + 1)
-        CI_upper = scipy.stats.beta.ppf(1 - significance_level/2, k_array, N - k_array + 1)
-
-        group_comparison = [[0, 1], [1, 0]]
-        title_list = ["group_0 - group_1", "group_1 - group_0"]
-        for i in range(M):
-            # sort the order of p-values under -log10 scale
-            sorted_p_vals = np.sort(p_vals[i, :]) # shape: (n_voxel,)
-            significance_percentage = np.sum(sorted_p_vals < 0.05) / N
-            print(significance_percentage)
-            axes[i].fill_between(th_p_log, -np.log10(CI_lower), -np.log10(CI_upper), color='grey', alpha=0.5,
-                    label=f'{int((1-significance_level)*100)}% Beta CI')
-            axes[i].plot(th_p_log, np.repeat(-np.log10(0.05), N), color='y', linestyle='--', label='threshold at -log10(0.05)')
-            axes[i].plot(th_p_log, -np.log10(th_p), color='orange', linestyle='--', label='y=x')
-            axes[i].plot(th_p_log, -np.log10(significance_level * th_p), color='red', linestyle='-', label='FDR(BH) control')
-            axes[i].scatter(th_p_log, -np.log10(sorted_p_vals), c='#1f77b4', s=4)
-            axes[i].set_xlim([0, np.max(-np.log10(k_array/N))])
-            axes[i].set_ylim([0, np.max(-np.log10(k_array/N))]) 
-            axes[i].set_xlabel("Expected -log10(P)", fontsize=20)
-            axes[i].set_ylabel("Observed -log10(P)", fontsize=20)
-            axes[i].set_title(f"{title_list[i]}: {significance_percentage*100:.2f}% voxels rejected", fontsize=30)
-            axes[i].legend()
-
-        # Save the figure
-        fig.savefig(filename)
-
-class BrainInference_Approximate(object):
+class _ApproximateInferenceBackend(_BaseInferenceBackend):
     def __init__(self, model, marginal_dist, link_func, regression_terms, 
                 dtype=torch.float64, device='cpu'):
-        self.model = model
-        self.marginal_dist = marginal_dist
-        self.link_func = link_func
-        self.regression_terms = regression_terms
-        self.dtype = dtype
-        self.device = device
+        super().__init__(model, marginal_dist, link_func, regression_terms, dtype=dtype, device=device)
     
     def load_params(self, data, params):
         # Support both legacy flat format and multi-group object-array format.
-        first_key = list(data.keys())[0]
-        first_val = data[first_key]
-        is_multigroup = (
-            hasattr(first_val, "ndim")
-            and first_val.ndim == 0
-            and hasattr(first_val, "item")
-            and isinstance(first_val.item(), dict)
-            and "Y" in first_val.item()
-            and "Z" in first_val.item()
-            and "X_spatial" in first_val.item()
-        )
-
-        if is_multigroup:
-            self.group_names = list(data.keys())
-            self.n_group = len(self.group_names)
-            self.n_subject = {}
-
-            first_group = self.group_names[0]
-            X_spatial = data[first_group].item()["X_spatial"]
-            B_scaled = X_spatial * 50 / X_spatial.shape[0]
-            self.B = np.concatenate([B_scaled, np.ones((B_scaled.shape[0], 1))], axis=1)
-
-            Y_all, Z_all = [], []
-            for group_name in self.group_names:
-                group_data = data[group_name].item()
-                Y_g = group_data["Y"]
-                Z_g = group_data["Z"]
-                self.n_subject[group_name] = Y_g.shape[0]
-                Y_all.append(Y_g)
-                Z_all.append(Z_g)
-
-            Z_cat = np.concatenate(Z_all, axis=0)
-            Z_scaled = Z_cat * 50 / Z_cat.shape[0]
-            self.Z = np.concatenate([Z_scaled, np.ones((Z_scaled.shape[0], 1))], axis=1)
-            self.Y = np.concatenate(Y_all, axis=0)
+        if self._is_multigroup_data(data):
+            self._load_stacked_multigroup_design(data)
         else:
-            self.group_names = ["Group_1"]
-            self.n_group = 1
-            self.n_subject = {"Group_1": data["Y"].shape[0]}
-            B_raw = data["X_spatial"]
-            B_scaled = B_raw * 50 / B_raw.shape[0]
-            self.B = np.concatenate([B_scaled, np.ones((B_scaled.shape[0], 1))], axis=1)
-            Z_raw = data["Z"]
-            Z_scaled = Z_raw * 50 / Z_raw.shape[0]
-            self.Z = np.concatenate([Z_scaled, np.ones((Z_scaled.shape[0], 1))], axis=1)
-            self.Y = data["Y"]
-
-        self._M, self._R = self.Z.shape
-        self._N, self._P = self.B.shape
+            self._load_flat_design(data)
         # Load parameters and re-scale
-        beta_raw = params["beta"]
-        self.beta = beta_raw.item() if getattr(beta_raw, "ndim", 1) == 0 else beta_raw
-        if isinstance(self.beta, dict):
-            raise NotImplementedError(
-                "BrainInference_Approximate does not support per-group beta dict. "
-                "Use full-model inference or provide a shared beta array."
-            )
+        self._load_shared_beta(params, reject_dict=True)
         # self.MU = compute_mu(self.rescaled_Z, self.rescaled_B, self.beta, mode="dask", block_size=1000) # shape: (n_subject*n_voxel, 1)
         self.MU = compute_mu(self.Z, self.B, self.beta, mode="dask", block_size=1000) # shape: (n_subject*n_voxel, 1)
         self.Y_reshape = self.Y.reshape(-1, 1) # shape: (n_subject*n_voxel, 1)
     
     def create_contrast(self, contrast_vector=None, contrast_name=None, polynomial_order=None):
-        self.contrast_vector = contrast_vector
-        self.contrast_name = contrast_name
         # Preprocess the contrast vector
         if contrast_vector is None:
             # Default: test the first non-intercept covariate (e.g. age).
             # Z columns are [cov_0 (age), ..., cov_{R-2}, intercept].
             # Contrast [1, 0, ..., 0] tests only the first covariate.
-            c = np.zeros((1, self._R))
-            c[0, 0] = 1
-            self.contrast_vector = c
+            contrast_vector = self._default_covariate_contrast(self._R, index=0)
         else:
-            self.contrast_vector = np.array(contrast_vector).reshape(1, -1)
-        # raise error if dimension of contrast vector doesn't match
-        if self.contrast_vector.shape[1] != self._R:
-            raise ValueError(
-                f"""The shape of contrast vector: {str(self.contrast_vector)}
-                doesn't match with number of covariates (_R={self._R})."""
-            )
-        # standardization (row sum 1)
-        self.contrast_vector = self.contrast_vector / np.sum(np.abs(self.contrast_vector), axis=1).reshape((-1, 1))
+            contrast_vector = np.array(contrast_vector).reshape(1, -1)
+        self._set_contrast(contrast_vector, self._R, contrast_name)
         
     def run_inference(self, method="FI", inference_filename=None, fig_filename=None):
         # Generalised linear hypothesis testing
-        p_vals, z_stats = self._glh_con_group(method)
-        # Save results if filename given
-        if inference_filename is not None:
-            os.makedirs(os.path.dirname(inference_filename), exist_ok=True)
-            np.savez(inference_filename, p_vals=p_vals, z_stats=z_stats)
+        p_vals, z_stats = self._load_or_compute_inference(
+            lambda: self._glh_con_group(method),
+            inference_filename=inference_filename,
+        )
         # Plot the estimated P, standard error of P, and p-values
         if fig_filename is not None:
             self.plot_1d(p_vals, fig_filename, 0.05)
@@ -707,9 +1082,13 @@ class BrainInference_Approximate(object):
         # Estimate the covariance of beta, from either FI or sandwich estimator
         start_time = time.time()
         if method == "FI":
-            F_beta = efficient_kronT_diag_kron(self.Z, self.B, self.MU, use_dask=use_dask, block_size=1e4) # shape: (R*P, R*P)
-            cov_beta = [robust_inverse(F_beta[i*self._P:(i+1)*self._P, i*self._P:(i+1)*self._P]+1e-6*np.eye(self._P)) for i in range(self._R)]
-            del F_beta
+            fisher_info = self.compute_fisher_information(
+                self.Z, self.B, self.MU, use_dask=use_dask, block_size=1e4,
+            )
+            cov_beta = self.blockwise_fisher_covariance(
+                fisher_info, self._R, self._P, ridge=1e-6,
+            )
+            del fisher_info
             logger.info("Fisher Information computed in %.1fs", time.time() - start_time)
         elif method == "sandwich":
             MU_matrix = self.MU.reshape(self._M, self._N)
@@ -729,7 +1108,7 @@ class BrainInference_Approximate(object):
                 ).reshape(self._M, self._N)
                 logger.info("Null mu computed for score-test sandwich (zeroed contrast covariate block)")
                 base_meat = sandwich_meat[len("null_"):]  # 'cluster' or 'iid'
-                cov_beta_full = self.poisson_sandwich_kron(
+                cov_beta_full = self.sandwich_covariance(
                     self.Z, self.B, self.Y, MU_matrix,
                     meat=base_meat,
                     ridge=0.0,
@@ -737,7 +1116,7 @@ class BrainInference_Approximate(object):
                     correction=sandwich_correction,
                 )  # (R*P, R*P)
             else:
-                cov_beta_full = self.poisson_sandwich_kron(
+                cov_beta_full = self.sandwich_covariance(
                     self.Z,
                     self.B,
                     self.Y,
@@ -755,21 +1134,18 @@ class BrainInference_Approximate(object):
 
         if method == "FI":
             # Var(c[s] * B_j @ beta_s) = c[s]^2 * B_j^T Cov(beta_s) B_j  (block-diagonal approx)
-            var_eta = list()
-            for s in range(self._R):
-                var_eta_s = np.einsum('ij,jk,ik->i', self.B, cov_beta[s], self.B) # (n_voxel,)
-                var_eta.append(var_eta_s)
-            var_eta = np.stack(var_eta, axis=0) # (R, N)
+            contrast_var_bar_eta = self.blockwise_contrast_variance(
+                self.B, self.contrast_vector, cov_beta,
+            )
             del cov_beta
             gc.collect()
-            contrast_var_bar_eta = self.contrast_vector**2 @ var_eta # (S, N)
         else:
             # Full sandwich variance: Var(c @ beta_map_j) = (c ⊗ B_j)^T Cov(beta) (c ⊗ B_j)
             # where c is the contrast over covariates (no bar_Z weighting)
-            CB = np.einsum('ij,kl->ikjl', self.contrast_vector, self.B)  # (S, N, R, P)
-            CB_flat = CB.reshape(self.contrast_vector.shape[0], self._N, -1)  # (S, N, R*P)
-            tmp = np.einsum('snk,kl->snl', CB_flat, cov_beta_full)           # (S, N, R*P)
-            contrast_var_bar_eta = np.sum(tmp * CB_flat, axis=-1)             # (S, N)
+            CB_flat = self.contrast_design(self.contrast_vector, self.B)
+            contrast_var_bar_eta = self.full_covariance_contrast_variance(
+                CB_flat, cov_beta_full,
+            )
 
         contrast_std_bar_eta = np.sqrt(np.maximum(contrast_var_bar_eta, 0.0)) # (S, N)
         # Two-sided Wald test
@@ -782,163 +1158,14 @@ class BrainInference_Approximate(object):
         )
         return p_vals, z_stats
 
-    def poisson_sandwich_kron(self,
-                                Z,
-                                B,
-                                y,
-                                mu,
-                                *,
-                                meat="cluster",
-                                ridge=0.0,
-                                mu_for_meat=None,
-                                correction="hc3"):
-        """Memory-efficient sandwich covariance for Poisson log-link GLM.
-
-        Args:
-            mu: fitted means used for the bread (Hessian).
-            mu_for_meat: if provided, residuals r = y - mu_for_meat are used
-                in the meat instead of y - mu.  Pass the null-model mu
-                (contrast covariate block zeroed) to get score-test residuals
-                that are centred under H0 by construction (eliminates sandwich
-                inflation from approximate S-GLM convergence).
-            correction: 'hc0' for raw sandwich, 'hc1' to multiply the meat by
-                M/(M-R), where M is subjects and R is covariates including the
-                intercept, or 'hc3' to divide each score residual by
-                (1 - h_ij), equivalently scaling each squared residual by
-                1/(1 - h_ij)^2. Here h_ij is the weighted GLM leverage for
-                subject i and voxel j under the Kronecker S-GLM design.
-        """
-        Z  = np.asarray(Z,  dtype=float)
-        B  = np.asarray(B,  dtype=float)
-        y  = np.asarray(y,  dtype=float)
-        mu = np.asarray(mu, dtype=float)
-
-        M, R = Z.shape
-        N, P = B.shape
-        p = R * P
-
-        if y.shape != (M, N) or mu.shape != (M, N):
-            raise ValueError("y and mu must have shape (M, N) matching Z and B.")
-        if not np.isfinite(Z).all() or not np.isfinite(B).all() or not np.isfinite(y).all():
-            raise ValueError("Inputs Z/B/y contain NaN or Inf.")
-
-        # Stabilize fitted means to prevent NaN/Inf propagation.
-        mu = np.nan_to_num(mu, nan=0.0, posinf=1e12, neginf=0.0)
-        mu = np.clip(mu, 1e-12, 1e12)
-
-        # Use separate mu for meat residuals if provided (score-test sandwich).
-        if mu_for_meat is not None:
-            mu_r = np.asarray(mu_for_meat, dtype=float)
-            mu_r = np.nan_to_num(mu_r, nan=0.0, posinf=1e12, neginf=0.0)
-            mu_r = np.clip(mu_r, 1e-12, 1e12)
-        else:
-            mu_r = mu
-
-        r = np.nan_to_num(y - mu_r, nan=0.0, posinf=0.0, neginf=0.0)
-
-        w_bread = np.einsum('ik,il,ij->klj', Z, Z, mu)
-        A = np.zeros((p, p))
-        for k in range(R):
-            for k2 in range(k, R):
-                block = B.T @ (B * w_bread[k, k2, :, None])
-                A[k*P:(k+1)*P, k2*P:(k2+1)*P] = block
-                if k != k2:
-                    A[k2*P:(k2+1)*P, k*P:(k+1)*P] = block
-
-        if ridge > 0:
-            A += ridge * np.eye(p)
-
-        # Ensure numeric validity/symmetry before factorization.
-        A = np.nan_to_num(A, nan=0.0, posinf=1e12, neginf=-1e12)
-        A = 0.5 * (A + A.T)
-
-        correction_kind = correction.lower()
-        if correction_kind == "hc0":
-            hc_factor = 1.0
-        elif correction_kind == "hc1":
-            if M <= R:
-                raise ValueError(
-                    f"HC1 correction requires M > R, got M={M}, R={R}. "
-                    "Use correction='hc0' for this setting."
-                )
-            hc_factor = M / float(M - R)
-        elif correction_kind == "hc3":
-            hc_factor = 1.0
-            ridge_eps = max(ridge, 1e-8)
-            try:
-                L_h, low_h = scipy.linalg.cho_factor(A + ridge_eps * np.eye(p))
-                Ainv_for_h = scipy.linalg.cho_solve((L_h, low_h), np.eye(p))
-            except (np.linalg.LinAlgError, ValueError):
-                logger.warning("Cholesky failed while computing HC3 leverage — using pseudo-inverse")
-                A_safe = np.nan_to_num(A, nan=0.0, posinf=1e12, neginf=-1e12)
-                Ainv_for_h = np.linalg.pinv(A_safe + 1e-6 * np.eye(p))
-
-            Ainv_blocks = Ainv_for_h.reshape(R, P, R, P).transpose(0, 2, 1, 3)
-            leverage_basis = np.einsum('jp,klpq,jq->klj', B, Ainv_blocks, B)
-            hii = mu * np.einsum('ik,il,klj->ij', Z, Z, leverage_basis)
-            hii = np.nan_to_num(hii, nan=0.0, posinf=1.0, neginf=0.0)
-            hii = np.clip(hii, 0.0, 0.999)
-            r = r / np.maximum(1.0 - hii, 1e-6)
-            logger.info(
-                "Applying HC3 sandwich correction: leverage min/mean/max = %.4g / %.4g / %.4g",
-                float(np.min(hii)), float(np.mean(hii)), float(np.max(hii)),
-            )
-            del Ainv_for_h, Ainv_blocks, leverage_basis, hii
-        else:
-            raise ValueError("correction must be 'hc0', 'hc1', or 'hc3'.")
-        if hc_factor != 1.0:
-            logger.info("Applying HC1 sandwich meat correction: M/(M-R)=%.6g", hc_factor)
-
-        meat_kind = meat.lower()
-        if meat_kind == "cluster":
-            Bt_r = B.T @ r.T
-            U = np.zeros((p, M))
-            for k in range(R):
-                U[k*P:(k+1)*P, :] = Bt_r * Z[:, k][None, :]
-            C = U
-            Bmeat = None
-        elif meat_kind == "iid":
-            w_meat = np.einsum('ik,il,ij->klj', Z, Z, r**2)
-            Bmeat = np.zeros((p, p))
-            for k in range(R):
-                for k2 in range(k, R):
-                    block = B.T @ (B * w_meat[k, k2, :, None])
-                    Bmeat[k*P:(k+1)*P, k2*P:(k2+1)*P] = block
-                    if k != k2:
-                        Bmeat[k2*P:(k2+1)*P, k*P:(k+1)*P] = block
-            C = None
-        else:
-            raise ValueError("meat must be 'iid' or 'cluster'.")
-
-        try:
-            ridge_eps = max(ridge, 1e-8)
-            L, low = scipy.linalg.cho_factor(A + ridge_eps * np.eye(p))
-            if meat_kind == "cluster":
-                Y = scipy.linalg.cho_solve((L, low), C)
-                cov = Y @ Y.T
-            else:
-                D   = scipy.linalg.cho_solve((L, low), Bmeat)
-                cov = scipy.linalg.cho_solve((L, low), D.T).T
-        except (np.linalg.LinAlgError, ValueError):
-            print("Cholesky failed (or non-finite matrix) — falling back to pseudo-inverse")
-            A_safe = np.nan_to_num(A, nan=0.0, posinf=1e12, neginf=-1e12)
-            Ainv = np.linalg.pinv(A_safe + 1e-6 * np.eye(p))
-            if meat_kind == "cluster":
-                Y = Ainv @ C
-                cov = Y @ Y.T
-            else:
-                Bmeat_safe = np.nan_to_num(Bmeat, nan=0.0, posinf=1e12, neginf=-1e12)
-                cov = Ainv @ Bmeat_safe @ Ainv
-
-        cov *= hc_factor
-        cov = 0.5 * (cov + cov.T)
-        return cov
-    
     def bread_term(self, Z, B, P, use_dask=True, block_size=1000):
-        XTWX = efficient_kronT_diag_kron(Z, B, P, use_dask=use_dask, block_size=block_size) # shape: (n_covariates*n_bases, n_covariates*n_bases)
-        XTWX = XTWX.reshape(self._P, self._R, self._P, self._R, order="F")
-        bread_term = [robust_inverse(XTWX[:,i,:,i]+1e-6*np.eye(self._P)) for i in range(self._R)]
-        del XTWX
+        fisher_info = self.compute_fisher_information(
+            Z, B, P, use_dask=use_dask, block_size=block_size,
+        )
+        bread_term = self.blockwise_fisher_covariance(
+            fisher_info, self._R, self._P, ridge=1e-6,
+        )
+        del fisher_info
         gc.collect()
 
         return bread_term
@@ -960,97 +1187,33 @@ class BrainInference_Approximate(object):
 
         return meat_term
 
-    def plot_1d(self, p_vals, filename, significance_level=0.05):
-        # slice list
-        fig, axes = plt.subplots(1, 2, figsize=(23, 11))
-
-        # Subplot 3
-        M, N = p_vals.shape
-        # theoretical p-values 
-        th_p = np.arange(1/float(N),1+1/float(N),1/float(N)) # shape: (n_voxel,)
-        th_p_log = -np.log10(th_p)
-        # kth order statistics
-        k_array = np.arange(start=1, stop=N+1, step=1)
-        # empirical confidence interval (estimated from p-values)
-        z_1, z_2 = scipy.stats.norm.ppf(significance_level), scipy.stats.norm.ppf(1-significance_level)
-        # Add the Beta confidence interval
-        CI_lower = scipy.stats.beta.ppf(significance_level/2, k_array, N - k_array + 1)
-        CI_upper = scipy.stats.beta.ppf(1 - significance_level/2, k_array, N - k_array + 1)
-
-        group_comparison = [[0, 1], [1, 0]]
-        title_list = ["group_0 - group_1", "group_1 - group_0"]
-        for i in range(M):
-            # sort the order of p-values under -log10 scale
-            sorted_p_vals = np.sort(p_vals[i, :]) # shape: (n_voxel,)
-            significance_percentage = np.sum(sorted_p_vals < 0.05) / N
-            print(significance_percentage)
-            axes[i].fill_between(th_p_log, -np.log10(CI_lower), -np.log10(CI_upper), color='grey', alpha=0.5,
-                    label=f'{int((1-significance_level)*100)}% Beta CI')
-            axes[i].plot(th_p_log, np.repeat(-np.log10(0.05), N), color='y', linestyle='--', label='threshold at -log10(0.05)')
-            axes[i].plot(th_p_log, -np.log10(th_p), color='orange', linestyle='--', label='y=x')
-            axes[i].plot(th_p_log, -np.log10(significance_level * th_p), color='red', linestyle='-', label='FDR(BH) control')
-            axes[i].scatter(th_p_log, -np.log10(sorted_p_vals), c='#1f77b4', s=4)
-            axes[i].set_xlim([0, np.max(-np.log10(k_array/N))])
-            axes[i].set_ylim([0, np.max(-np.log10(k_array/N))]) 
-            axes[i].set_xlabel("Expected -log10(P)", fontsize=20)
-            axes[i].set_ylabel("Observed -log10(P)", fontsize=20)
-            axes[i].set_title(f"{title_list[i]}: {significance_percentage*100:.2f}% voxels rejected", fontsize=30)
-            axes[i].legend()
-
-        # Save the figure
-        fig.savefig(filename)
-
-class BrainInference_UKB(object):
+class _UKBInferenceBackend(_BaseInferenceBackend):
     def __init__(self, model, marginal_dist, link_func, regression_terms, 
                 dtype=torch.float64, device='cpu'):
-        self.model = model
-        self.marginal_dist = marginal_dist
-        self.link_func = link_func
-        self.regression_terms = regression_terms
-        self.dtype = dtype
-        self.device = device
+        super().__init__(model, marginal_dist, link_func, regression_terms, dtype=dtype, device=device)
 
     def load_params(self, data, params):
         # Load data
-        B, Z = data["X_spatial"], data["Z"]
-        B = B * 50 / B.shape[0]
-        Z = Z * 50 / Z.shape[0]
-        self.B = np.concatenate([B, np.ones((B.shape[0], 1))], axis=1)
-        self.Y = data["Y"]
-        self.Z = np.concatenate([Z, np.ones((Z.shape[0], 1))], axis=1)
-        self._M, self._R = self.Z.shape
-        self._N, self._P = self.B.shape
+        self._load_flat_design(data)
         # Load parameters and re-scale
-        self.beta = params["beta"]
+        self._load_shared_beta(params)
         # MU
         if self.model == "SpatialBrainLesion":
-            self.MU = compute_mu(self.Z, self.B, self.beta, mode="dask", block_size=5000) # shape: (n_subject*n_voxel, 1)
-            self.MU = self.MU.reshape(self._M, self._N) # shape: (n_subject, n_voxel)
+            self.MU = self._compute_mu_matrix(self.Z, self.B, self.beta, block_size=5000)
             P = self.MU * np.exp(-self.MU) # shape: (n_subject, n_voxel)
             P_mean = np.mean(P, axis=0) # shape: (n_voxel,)
 
     def create_contrast(self, contrast_vector=None, contrast_name=None, polynomial_order=1):
-        self.contrast_vector = contrast_vector
-        self.contrast_name = contrast_name
         # Preprocess the contrast vector
         if contrast_name == "age":
-            if polynomial_order == 1:
-                self.contrast_vector = np.array([0, 1, 0, 0, 0]).reshape(-1, self._R)
-            else:
-                self.contrast_vector = np.array([
-                                            [0, 0, 1, 0, 0, 0, 0, 0],
-                                            [0, 0, 0, 1, 0, 0, 0, 0],
-                                            [0, 0, 0, 0, 1, 0, 0, 0]
-                                        ]).reshape(-1, self._R)
+            contrast_vector = self._ukb_age_contrast(self._R, polynomial_order)
         else:
-            self.contrast_vector = (
+            contrast_vector = (
                 np.eye(self._R)
                 if contrast_vector is None
                 else np.array(contrast_vector).reshape(-1, self._R)
             )
-        self._S = self.contrast_vector.shape[0]
-        # standardization (row sum 1)
-        self.contrast_vector = self.contrast_vector / np.sum(np.abs(self.contrast_vector), axis=1).reshape((-1, 1))
+        self._set_contrast(contrast_vector, self._R, contrast_name)
 
     def run_inference(self, alpha=0.05, method="FI", lesion_mask=None, XTWX_filename=None, Fisher_info_filename=None,
                       meat_term_filename=None, bread_term_filename=None, p_vals_filename=None, 
@@ -1062,27 +1225,30 @@ class BrainInference_UKB(object):
         self.p_vals_filename = p_vals_filename
         self.z_vals_filename = z_vals_filename
         self.fig_dir = os.path.dirname(fig_filename)
-        z_threshold = scipy.stats.norm.ppf(1-alpha)
         # Generalised linear hypothesis testing
-        if os.path.exists(self.p_vals_filename) and os.path.exists(self.z_vals_filename):
-            p_vals = np.load(self.p_vals_filename)["p_vals"]
-            z_stats = np.load(self.z_vals_filename)["z_stats"]
-            print("loaded p-values and z-stats from file.")
-        else:
+        def compute():
             if self.model == "SpatialBrainLesion":
-                p_vals, z_stats = self.SpatialGLM_glh_con_group(method, lesion_mask, True, 1e4)
+                return self.SpatialGLM_glh_con_group(method, lesion_mask, True, 1e4)
             elif self.model == "MassUnivariateRegression":
-                p_vals, z_stats = self.MUM_glh_con_group(lesion_mask)
-            else:
-                raise ValueError(f"Model {self.model} not supported for inference.")
-            np.savez(self.p_vals_filename, p_vals=p_vals)
-            np.savez(self.z_vals_filename, z_stats=z_stats)
-            print("saved p-values and z-stats to file.")
+                return self.MUM_glh_con_group(lesion_mask)
+            raise ValueError(f"Model {self.model} not supported for inference.")
+
+        p_vals, z_stats = self._load_or_compute_inference(
+            compute,
+            p_vals_filename=self.p_vals_filename,
+            z_vals_filename=self.z_vals_filename,
+        )
         # Plot the estimated P, standard error of P, and p-values
         self.histogram_z_stats(z_stats, fig_filename.replace(".png", "_z_stats_histogram.png"))
-        save_nifti(p_vals.flatten(), lesion_mask, os.path.join(self.fig_dir, f"p_vals_{self.model}_{method}.nii.gz"))
-        save_nifti(z_stats.flatten(), lesion_mask, os.path.join(self.fig_dir, f"z_stats_{self.model}_{method}.nii.gz"))
-        plot_brain(p=z_stats, brain_mask=lesion_mask, threshold=z_threshold, output_filename=fig_filename)
+        self._save_brain_outputs(p_vals, z_stats, lesion_mask, self.fig_dir, method)
+        z_threshold = scipy.stats.norm.ppf(1-alpha)
+        print(z_threshold, "z_threshold for alpha=", alpha)
+        print(np.count_nonzero(p_vals < alpha), p_vals.size, "significant voxels at alpha=", alpha)
+        print(np.count_nonzero(z_stats > z_threshold), z_stats.size, "voxels with z_stat > z_threshold at alpha=", alpha)
+        self._plot_brain_z_maps(
+            z_stats, fig_filename, lesion_mask, alpha=alpha,
+            suffix_multiple=False, output_uncorrected=True,
+        )
         
         # # FDR correction
         # rejected, corr_p = fdrcor
@@ -1098,11 +1264,15 @@ class BrainInference_UKB(object):
         # Estimate the variance of beta, from either FI or sandwich estimator
         # Compute the Fisher information matrix
         if method == "FI":
-            if not os.path.exists(self.XTWX_filename):
-                XTWX = efficient_kronT_diag_kron(self.Z, self.B, self.MU, use_dask=use_dask, block_size=block_size) # shape: (n_covariates*n_bases, n_covariates*n_bases)
-                np.savez(self.XTWX_filename, XTWX=XTWX)
-            else:
-                XTWX = np.load(self.XTWX_filename)["XTWX"]
+            XTWX = self.compute_fisher_information(
+                self.Z,
+                self.B,
+                self.MU,
+                use_dask=use_dask,
+                block_size=block_size,
+                cache_filename=self.XTWX_filename,
+                cache_key="XTWX",
+            )
 
         CB = np.einsum('ij,kl->ikjl', self.contrast_vector, self.B) # shape: (_S, _N, _R, _P)
         CB_flat = CB.reshape(self._S, self._N, -1) # shape: (_S, _N, _R*_P)
@@ -1113,18 +1283,23 @@ class BrainInference_UKB(object):
         plot_brain(p=CB_beta.flatten(), brain_mask=lesion_mask, threshold=0, vmax=None, output_filename=os.path.join(self.fig_dir, "numerator_map_SGLM.png"))
         # shape: (_S, _N) 
         if method == "FI":
-            cov_beta = np.linalg.pinv(XTWX) # shape: (_R*_P, _R*_P)
-            tmp = np.einsum('snk,kl->snl', CB_flat, cov_beta)         # (S, N, K)
-            contrast_var_eta = np.sum(tmp * CB_flat, axis=-1, keepdims=True)  # (S, N, 1)
+            cov_beta = self.fisher_covariance(XTWX, ridge=0.0, inverse="pinv")
+            contrast_var_eta = self.full_covariance_contrast_variance(
+                CB_flat, cov_beta, keepdims=True,
+            )
             plot_brain(p=np.sqrt(contrast_var_eta).flatten(), brain_mask=lesion_mask, threshold=0, vmax=None, output_filename=os.path.join(self.fig_dir, "denominator_map_SGLM_FI.png"))
             # del bread_term, meat_term, cov_beta
         elif method == "sandwich":
-            cov_beta, diag = self.poisson_sandwich_kron(self.Z, self.B, self.Y, self.MU, meat="iid", ridge=0, return_diagnostics=True)
+            cov_beta, diag = self.sandwich_covariance(
+                self.Z, self.B, self.Y, self.MU,
+                meat="iid", ridge=0, return_diagnostics=True,
+            )
             print(np.min(np.diag(cov_beta)), np.mean(np.diag(cov_beta)), np.max(np.diag(cov_beta)), "cov_beta diag stats")
             # meat_term = self.meat_term(self.Z, self.B, self.MU, self.Y) 
             # bread_term = self.bread_term(self.Z, self.B, self.MU, self.Y)
-            tmp = np.einsum('snk,kl->snl', CB_flat, cov_beta)         # (S, N, K)
-            contrast_var_eta = np.sum(tmp * CB_flat, axis=-1, keepdims=True)  # (S, N, 1)
+            contrast_var_eta = self.full_covariance_contrast_variance(
+                CB_flat, cov_beta, keepdims=True,
+            )
             plot_brain(p=np.sqrt(contrast_var_eta).flatten(), brain_mask=lesion_mask, threshold=0, vmax=None, output_filename=os.path.join(self.fig_dir, "denominator_map_SGLM_sandwich.png"))
             # del bread_term, meat_term, cov_beta
         if self._S == 1:
@@ -1161,16 +1336,7 @@ class BrainInference_UKB(object):
         # check if there is only one non-zero contrast
         if np.count_nonzero(self.contrast_vector) == 1:
             nonzero_index = np.nonzero(self.contrast_vector)[1].item()
-            if self.link_func == "log":
-                MU = np.exp(self.Z @ self.beta) # shape: (n_subject, n_voxel)
-                FI = np.einsum('im,ij,ik->jmk', self.Z, MU, self.Z)  # shape: (N, R, R)
-                Cov_beta = np.linalg.pinv(FI) # shape: (N, R, R)
-            elif self.link_func == "logit":
-                MU = 1 / (1 + np.exp(-(self.Z @ self.beta))) # shape: (n_subject, n_voxel)
-                FI = np.einsum('im,ij,ik->jmk', self.Z, MU * (1 - MU), self.Z)  # shape: (N, R, R)
-                Cov_beta = np.linalg.pinv(FI) # shape: (N, R, R)
-            else:
-                raise ValueError(f"Link function {self.link_func} not supported.")
+            Cov_beta, _ = self.mass_univariate_fisher_covariance(self.Z, self.beta)
         else:
             raise NotImplementedError("FI method only implemented for single non-zero contrast in MUM.")
         var_beta = Cov_beta[:, nonzero_index, nonzero_index] # shape: (n_voxel,)
@@ -1183,8 +1349,7 @@ class BrainInference_UKB(object):
         z_stats_eta = contrast_beta_covariates / contrast_std_beta
         z_stats = z_stats_eta.reshape(-1)
         print(np.min(z_stats), np.max(z_stats), "z stats range")
-        # z_stats = np.concatenate([z_stats_eta, -z_stats_eta], axis=0) # shape: (2, n_voxel)
-        p_vals = 2 * scipy.stats.norm.sf(abs(z_stats))
+        p_vals = scipy.stats.norm.sf(z_stats) # shape: (_N, 1)
         print(p_vals.shape, z_stats.shape)
         print(np.min(p_vals), np.max(p_vals), np.count_nonzero(p_vals < 0.05), p_vals.shape)
 
@@ -1193,7 +1358,7 @@ class BrainInference_UKB(object):
     def meat_term(self, Z, B, MU, Y, batch_M=1000):
         if MU.shape != Y.shape:
             MU = MU.reshape(Y.shape) # shape: (_M, _N)
-        if not os.path.exists(self.meat_term_filename):
+        def compute_meat():
             meat_term_1 = np.zeros((self._P * self._R, self._P * self._R)) # shape: (_P*_R, _P*_R)
             W = Y - MU
             BW = W.dot(B)    # shape (M, P)
@@ -1201,169 +1366,32 @@ class BrainInference_UKB(object):
             meat_term = T.T.dot(T)   # shape (PR, PR)
             del W, BW, T
             gc.collect()
-            np.savez(self.meat_term_filename, meat_term=meat_term)
-        else:
-            print("Loading precomputed meat term...")
-            meat_term = np.load(self.meat_term_filename)["meat_term"]
+            return meat_term
 
-        return meat_term
+        return self._load_or_compute_array(
+            self.meat_term_filename,
+            "meat_term",
+            compute_meat,
+            load_message="Loading precomputed meat term...",
+        )
     
     def bread_term(self, Z, B, MU, Y, dtype=np.float64, chunk_rows=256, epsilon=1e-6):
         if MU.shape != Y.shape:
             MU = MU.reshape(Y.shape)
-        if not os.path.exists(self.bread_term_filename):
-            print("Computing bread term...")
+        def compute_bread():
             start_time = time.time()
-            bread_term = np.zeros((self._P * self._R, self._P * self._R)) # shape: (_P*_R, _P*_R)
-
-            for i in range(self._M): 
-                print(f"Processing subject {i+1}/{self._M}", end='\r')
-                # X_i = np.kron(Z[i,:], B) # shape: (_N, _P*_R) 
-                # U_i = X_i.T * np.sqrt(MU[i, :]) # shape: (_P*_R, _N) 
-                # bread_term += U_i @ U_i.T # shape: (_P*_R, _P*_R)
-                zi = Z[i, :]                    # shape: (R,)
-                mu_i = MU[i, :]          
-                G_B = B.T @ (mu_i[:, None] * B)
-                G_z = np.outer(zi, zi)          # (R, R)
-                # Accumulate
-                bread_term += np.kron(G_z, G_B)
-            # print(np.min(np.diag(bread_term)), np.mean(np.diag(bread_term)), np.max(np.diag(bread_term)), "bread term diag stats")
-            # bread_term += epsilon * np.eye(self._P * self._R)
-            # print("Added epsilon {} to bread term".format(epsilon))
+            bread_term = self.compute_fisher_information(
+                Z, B, MU, use_dask=False, cache_filename=None,
+            )
             print(np.min(np.diag(bread_term)), np.mean(np.diag(bread_term)), np.max(np.diag(bread_term)), "bread term diag stats")
             print("Time taken for bread term computation:", time.time() - start_time)
-            del Z, B, MU, Y
             gc.collect()
-            np.savez(self.bread_term_filename, bread_term=bread_term)
-        else:
-            print("Loading precomputed bread term...")
-            bread_term = np.load(self.bread_term_filename)["bread_term"]
+            return bread_term
 
-        return bread_term
-
-    def poisson_sandwich_kron(self,
-                                Z,                 # shape (M, R) - subject covariates
-                                B,                 # shape (N, P) - spatial bases
-                                y,                 # shape (M, N)
-                                mu,                # shape (M, N)
-                                *,
-                                meat="cluster",
-                                ridge=0.0,
-                                return_diagnostics=False
-                                ):
-        """
-        Memory-efficient sandwich covariance for Poisson log-link GLM,
-        exploiting  X[i,j,:] = kron(Z[i,:], B[j,:])  (never materialised).
-
-        The full design X would be  (M, N, R*P)  which is ~24 GB for
-        typical problem sizes.  This function avoids forming it.
-
-        Bread  A = sum_i X_i^T diag(mu_i) X_i
-            Block (k,k') of A = B^T diag(w_{kk'}) B
-            where  w_{kk'}[j] = sum_i Z[i,k] Z[i,k'] mu[i,j]
-
-        Cluster meat  C_i = kron(z_i, B^T r_i)
-        iid     meat  block structure same as bread but with r^2
-        """
-        Z  = np.asarray(Z,  dtype=float)
-        B  = np.asarray(B,  dtype=float)
-        y  = np.asarray(y,  dtype=float)
-        mu = np.asarray(mu, dtype=float)
-
-        M, R = Z.shape
-        N, P = B.shape
-        p = R * P
-
-        if y.shape != (M, N) or mu.shape != (M, N):
-            raise ValueError("y and mu must have shape (M, N) matching Z and B.")
-        if np.any(mu <= 0):
-            raise ValueError("All mu must be > 0.")
-
-        r = y - mu                                          # (M, N)
-
-        # ------------------------------------------------------------------
-        # Bread:  A  (p x p)
-        # w[k,l,j] = sum_i Z[i,k]*Z[i,l]*mu[i,j]
-        # ------------------------------------------------------------------
-        w_bread = np.einsum('ik,il,ij->klj', Z, Z, mu)     # (R, R, N)
-
-        A = np.zeros((p, p))
-        for k in range(R):
-            for k2 in range(k, R):
-                block = B.T @ (B * w_bread[k, k2, :, None]) # (P, P)
-                A[k*P:(k+1)*P, k2*P:(k2+1)*P] = block
-                if k != k2:
-                    A[k2*P:(k2+1)*P, k*P:(k+1)*P] = block  # symmetric
-
-        if ridge > 0:
-            A += ridge * np.eye(p)
-
-        # ------------------------------------------------------------------
-        # Meat
-        # ------------------------------------------------------------------
-        meat_kind = meat.lower()
-
-        if meat_kind == "cluster":
-            # U_i = X_i^T r_i = kron(z_i, B^T r_i)
-            Bt_r = B.T @ r.T                                # (P, M)
-            U = np.zeros((p, M))
-            for k in range(R):
-                U[k*P:(k+1)*P, :] = Bt_r * Z[:, k][None, :] # (P, M)
-            C = U                                            # (p, M)
-            Bmeat = None
-
-        elif meat_kind == "iid":
-            # Same block structure as bread but weighted by r^2
-            w_meat = np.einsum('ik,il,ij->klj', Z, Z, r**2)  # (R, R, N)
-            Bmeat = np.zeros((p, p))
-            for k in range(R):
-                for k2 in range(k, R):
-                    block = B.T @ (B * w_meat[k, k2, :, None])
-                    Bmeat[k*P:(k+1)*P, k2*P:(k2+1)*P] = block
-                    if k != k2:
-                        Bmeat[k2*P:(k2+1)*P, k*P:(k+1)*P] = block
-            C = None
-        else:
-            raise ValueError("meat must be 'iid' or 'cluster'.")
-
-        # ------------------------------------------------------------------
-        # Solve:  cov = A^{-1} meat A^{-1}
-        # ------------------------------------------------------------------
-        try:
-            L, low = scipy.linalg.cho_factor(A)
-            if meat_kind == "cluster":
-                Y = scipy.linalg.cho_solve((L, low), C)           # A^{-1} U,  (p, M)
-                cov = Y @ Y.T
-            else:
-                D   = scipy.linalg.cho_solve((L, low), Bmeat)     # A^{-1} Bmeat
-                cov = scipy.linalg.cho_solve((L, low), D.T).T     # (A^{-1} Bmeat) A^{-1}
-        except np.linalg.LinAlgError:
-            print("Cholesky failed — falling back to pseudo-inverse")
-            Ainv = np.linalg.pinv(A)
-            if meat_kind == "cluster":
-                Y = Ainv @ C
-                cov = Y @ Y.T
-            else:
-                cov = Ainv @ Bmeat @ Ainv
-
-        cov = 0.5 * (cov + cov.T)
-
-        if return_diagnostics:
-            diag_info = {
-                "method": "kron_cholesky",
-                "meat": meat_kind,
-                "ridge": ridge,
-                "M": M, "N": N, "R": R, "P": P, "p": p,
-            }
-            return cov, diag_info
-        return cov
-
-    def histogram_z_stats(self, z_stats, filename):
-        plt.figure(figsize=(10, 6))
-        plt.hist(z_stats.flatten(), bins=100, color='blue', alpha=0.7, edgecolor='black')
-        plt.title('Histogram of Z-statistics', fontsize=16)
-        plt.xlabel('Z-statistic', fontsize=14)
-        plt.ylabel('Frequency', fontsize=14)
-        plt.grid(axis='y', alpha=0.75)
-        plt.savefig(filename)
-        plt.close()
+        return self._load_or_compute_array(
+            self.bread_term_filename,
+            "bread_term",
+            compute_bread,
+            load_message="Loading precomputed bread term...",
+            compute_message="Computing bread term...",
+        )

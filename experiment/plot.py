@@ -200,18 +200,36 @@ def plot_intensity_3d(G, p, p_hat, n_voxel, filename, slice_idx=None):
     
     return 
 
-def plot_brain(p, brain_mask, slice_idx=None, threshold=5e-4, vmin=0, vmax=None,
-               output_filename="test.png", colorbar=True):
+def plot_brain(p, brain_mask, slice_idx=None, threshold=5e-4, vmin=None, vmax=None,
+               output_filename="test.png", colorbar=True, cmap='inferno'):
     print("threshold", threshold)
     brain_mask_data = brain_mask.get_fdata()
     mask_indices = np.where(brain_mask_data > 0)
     if len(p) != len(mask_indices[0]):
         raise ValueError("The number of voxels in the probability map is not equal to the number of voxels in the brain mask")
-    # nan for p-values outside of brain mask
-    nifti_data = np.zeros(brain_mask_data.shape, dtype=np.float32)
+    finite_p = np.asarray(p, dtype=float).ravel()
+    finite_p = finite_p[np.isfinite(finite_p)]
+    has_negative = finite_p.size > 0 and np.nanmin(finite_p) < 0
+    has_positive = finite_p.size > 0 and np.nanmax(finite_p) > 0
+    signed_map = has_negative and has_positive
+    if vmax is None:
+        if finite_p.size == 0:
+            vmax = 1.0
+        elif signed_map:
+            vmax = float(np.nanpercentile(np.abs(finite_p), 99.0))
+        else:
+            vmax = float(np.nanpercentile(finite_p, 99.0))
+        if not np.isfinite(vmax) or vmax <= 0:
+            vmax = 1.0
+    if vmin is None:
+        vmin = -vmax if signed_map else 0.0
+    plot_threshold = float(threshold) if threshold is not None else None
+    if plot_threshold is not None and plot_threshold <= 0:
+        plot_threshold = 1e-6
+    # nan for values outside of brain mask
+    nifti_data = np.full(brain_mask_data.shape, np.nan, dtype=np.float32)
     # Assign p-vals/z-statistics to the masked voxels
     nifti_data[mask_indices] = p.ravel()
-    # # Only display the values below the threshold 0.05
     # Create a new NIfTI image
     nifti_image = nib.Nifti1Image(nifti_data, affine=brain_mask.affine, header=brain_mask.header)
     cut_coords = [slice_idx] if slice_idx is not None else [0, 6, 12, 18, 24, 30, 36]
@@ -220,11 +238,13 @@ def plot_brain(p, brain_mask, slice_idx=None, threshold=5e-4, vmin=0, vmax=None,
         cut_coords=cut_coords,
         display_mode='z', 
         draw_cross=False, 
-        cmap='inferno',
-        threshold=threshold,
+        cmap=cmap,
+        threshold=plot_threshold,
         colorbar=colorbar,
         vmin=vmin,
         vmax=vmax,
+        symmetric_cbar=signed_map,
+        dim=0,
         output_file=output_filename
     )
     print(output_filename)

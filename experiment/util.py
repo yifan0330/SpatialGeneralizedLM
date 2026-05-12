@@ -49,6 +49,7 @@ def preprocess_Z(simulated_dset, Z, polynomial_order):
         Age_col, Headsize_col, CVR_col = [Z[:, i:i+1] for i in [1, 2, 3]]
         # Polynomial order (Only for Age)
         Age_col = np.concatenate([Age_col**i for i in range(1, polynomial_order+1)], axis=1)
+        print(Age_col.shape)
         scalar_covariates = np.concatenate((Age_col, Headsize_col, CVR_col), axis=1)
         scalar_covariates -= np.mean(scalar_covariates, axis=0)
         # scalar_covariates /= np.std(scalar_covariates, axis=0)

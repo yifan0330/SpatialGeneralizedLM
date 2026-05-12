@@ -1,7 +1,7 @@
 from data_simulation import simulated_data, GRF_simulated_data, SpatialHomo_simulated_data, SubjectHomo_simulated_data, Biobank_data
 from bspline import B_spline_bases, RandomFourierFeatures_3D, QMCFeatures_3D
 from regression import BrainRegression_full, BrainRegression_Approximate
-from inference import BrainInference_full, BrainInference_Approximate, BrainInference_UKB
+from inference import BrainInference
 from util import create_lesion_mask, preprocess_Z
 from plot import plot_brain, save_nifti
 from nilearn.datasets import load_mni152_template
@@ -509,22 +509,20 @@ if args.run_inference:
     results = np.load(results_filename, allow_pickle=True)
     if args.full_model:
         # BrainInference
-        BI = BrainInference_full(model=model, space_dim=space_dim,marginal_dist=args.marginal_dist, 
-                            link_func=args.link_func, regression_terms=args.regression_terms,
-                            random_seed=args.random_seed, fewer_voxels=False,dtype=torch.float64, device=device)
+        BI = BrainInference(model=model, inference_type="full", space_dim=space_dim,
+                            marginal_dist=args.marginal_dist, link_func=args.link_func,
+                            regression_terms=args.regression_terms, random_seed=args.random_seed,
+                            fewer_voxels=False, dtype=torch.float64, device=device)
         BI.load_params(data=data, params=results)
         BI.create_contrast(contrast_vector=args.contrast_vector, contrast_name=args.contrast_name)
         BI.run_inference(method=args.inference_method, inference_filename=inference_filename,
                          fig_filename=fig_filename, lesion_mask=smooth_lesion_mask)
     else:
-        if simulated_dset:
-            BI = BrainInference_Approximate(model=model, marginal_dist=args.marginal_dist, 
-                                link_func=args.link_func, regression_terms=args.regression_terms,
-                                dtype=torch.float64, device=device)
-        else:
-            BI = BrainInference_UKB(model=model, marginal_dist=args.marginal_dist, 
-                                link_func=args.link_func, regression_terms=args.regression_terms,
-                                dtype=torch.float64, device=device)
+        inference_type = "approximate" if simulated_dset else "ukb"
+        BI = BrainInference(model=model, inference_type=inference_type,
+                            marginal_dist=args.marginal_dist, link_func=args.link_func,
+                            regression_terms=args.regression_terms,
+                            dtype=torch.float64, device=device)
         BI.load_params(data=data, params=results)
         BI.create_contrast(contrast_vector=args.contrast_vector, contrast_name=args.contrast_name,
                            polynomial_order=polynomial_order)
