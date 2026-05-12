@@ -321,8 +321,14 @@ def log_poisson_likelihood(lam, Y, use_dask=False, block_size=1000):
         NLL: Negative log likelihood
     """
     if use_dask:
-        lam = _to_dask_array(lam, chunks=(block_size,)).ravel()
-        Y = _to_dask_array(Y, chunks=(block_size,)).ravel()
+        if isinstance(lam, da.Array):
+            lam = lam.ravel()
+        else:
+            lam = da.from_array(np.asarray(lam).reshape(-1), chunks=(block_size,))
+        if isinstance(Y, da.Array):
+            Y = Y.ravel()
+        else:
+            Y = da.from_array(np.asarray(Y).reshape(-1), chunks=(block_size,))
         lam = da.maximum(lam, np.finfo(float).tiny)
         return (Y * da.log(lam) - lam).mean()
 
