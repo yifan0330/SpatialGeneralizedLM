@@ -1,297 +1,353 @@
-from typing import List
+"""Torch model definitions for spatial brain-lesion regression.
+
+The module exposes two public model classes used by the regression and inference
+pipelines:
+
+* ``SpatialBrainLesionModel``: spatial basis model with optional per-group betas.
+* ``MassUnivariateRegression``: independent voxel-wise GLM coefficients.
+
+Shared link-function and likelihood logic lives in private helpers/base classes to
+keep model implementations concise and consistent.
+"""
+
+from typing import Callable, List, Optional, Sequence
+
 import torch
 import torch.nn as nn
-from torch.distributions import Bernoulli
-import time
 
-class SpatialBrainLesionModel(nn.Module):
 
-    def __init__(self,
-                 n_covariates: int,
-                 n_auxiliary: int,
-                 n_bases: int,
-                 n_samples: int = 100,
-                 std_params: float = 1.0,
-                 std_auxiliary: float = 1.0,
-                 link_func: str = "logit",
-                 marginal_dist: str = "Bernoulli",
-                 regression_terms: List[str] = ["multiplicative", "additive"],
-                 group_names: list = None,
-                 device: str = "cpu",
-                 dtype = torch.float32):
-        """ Spatial brain lesion model
+_DEFAULT_REGRESSION_TERMS = ("multiplicative", "additive")
+_EPS = 1e-6
 
-        Args:
-            n_covariates: Number of covariates
-            n_auxiliary: Number of auxiliary variables
-            n_bases: Number of bases for spatial representations
-            n_samples: Number of samples for Monte Carlo approximation
-            std_params: Standard deviation of Gaussian parameters
-            std_auxiliary: Standard deviation of Gaussian auxiliary variables
-            link_func: Link function for intensity function, options: "logit", "log"
-            marginal_dist: Marginal distribution at each spatial location, options: "Bernoulli", "Poisson"
-            regression_terms: Regression terms, options: ["multiplicative", "additive"]
 
-        X: Spatial design matrix of shape (n_voxel, n_bases)
-        Y: Binary lesion mask of shape (n_subject, n_voxel)
-        Z: Covariates matrix of shape (n_subject, n_covariates)
-        A: Random auxiliary variables of shape (n_subject, n_auxiliary)
-        """
+def _normalise_regression_terms(regression_terms: Optional[Sequence[str]]) -> List[str]:
+    """Return regression terms as a fresh list to avoid mutable defaults."""
+    if regression_terms is None:
+        return list(_DEFAULT_REGRESSION_TERMS)
+    return list(regression_terms)
+
+
+def _build_inverse_link(link_func: str) -> Callable[[torch.Tensor], torch.Tensor]:
+    """Create the inverse-link function used to map linear predictors to means."""
+    if link_func == "logit":
+        return torch.sigmoid
+    if link_func == "log":
+        return torch.exp
+    if link_func == "arctanh":
+        return lambda z: (torch.tanh(z) + 1.0) / 2.0
+    raise ValueError(f"Link function {link_func} not implemented")
+
+
+def _safe_log(tensor: torch.Tensor, eps: float = _EPS) -> torch.Tensor:
+    """Numerically stable logarithm."""
+    return torch.log(torch.clamp(tensor, min=eps))
+
+
+def _distribution_nll(
+    P: torch.Tensor,
+    Y: torch.Tensor,
+    marginal_dist: str,
+    *,
+    reduction: str = "mean",
+    eps: float = _EPS,
+) -> torch.Tensor:
+    """Compute negative log-likelihood for a supported marginal distribution."""
+    if marginal_dist == "Bernoulli":
+        P = torch.clamp(P, min=eps, max=1.0 - eps)
+        nll = -(_safe_log(P, eps) * Y + _safe_log(1.0 - P, eps) * (1.0 - Y))
+    elif marginal_dist == "Poisson":
+        P = torch.clamp(P, min=eps)
+        nll = -(Y * _safe_log(P, eps) - P)
+    elif marginal_dist == "NB":
+        P = torch.clamp(P, min=eps)
+        r = torch.tensor(1.0, dtype=P.dtype, device=P.device)
+        p = torch.clamp(r / (r + P), min=eps, max=1.0 - eps)
+        nll = -(
+            torch.lgamma(Y + r)
+            - torch.lgamma(r)
+            - torch.lgamma(Y + 1.0)
+            + r * _safe_log(p, eps)
+            + Y * _safe_log(1.0 - p, eps)
+        )
+    else:
+        raise ValueError(f"Marginal distribution {marginal_dist} not supported")
+
+    if reduction == "sum":
+        return nll.sum()
+    if reduction == "mean":
+        return nll.mean()
+    raise ValueError(f"Reduction {reduction} not supported")
+
+
+class _BaseBrainLesionTorchModel(nn.Module):
+    """Shared bookkeeping, link-function, and likelihood behaviour."""
+
+    def __init__(
+        self,
+        *,
+        n_covariates: int,
+        n_auxiliary: int,
+        n_samples: int,
+        std_params: float,
+        std_auxiliary: float,
+        link_func: str,
+        marginal_dist: str,
+        regression_terms: Optional[Sequence[str]],
+        device: str,
+        dtype,
+    ):
         super().__init__()
         self.n_covariates = n_covariates
         self.n_auxiliary = n_auxiliary
-        self.n_bases = n_bases
         self.n_samples = n_samples
         self.std_params = std_params
         self.std_auxiliary = std_auxiliary
-        if link_func == "logit":
-            self.inverse_link_func = nn.Sigmoid()
-        elif link_func == "log":
-            self.inverse_link_func = torch.exp
-        elif link_func == "arctanh":
-            self.inverse_link_func = lambda z: (nn.Tanh()(z) + 1.) / 2.
-        else:
-            raise ValueError(f"Link function {link_func} not implemented")
+        self.link_func = link_func
+        self.inverse_link_func = _build_inverse_link(link_func)
         self.marginal_dist = marginal_dist
-        self.regression_terms = regression_terms
+        self.regression_terms = _normalise_regression_terms(regression_terms)
         self.device = torch.device(device)
         self.dtype = dtype
         self._kwargs = {"device": self.device, "dtype": self.dtype}
-        # regression coefficients for covariates
-        # Per-group betas for multi-group; single shared beta otherwise
-        self.group_names = group_names
-        if group_names is not None and len(group_names) > 1:
-            self.betas = nn.ParameterDict({
-                g: nn.Parameter(torch.randn(n_bases, self.n_covariates, **self._kwargs) * self.std_params)
-                for g in group_names
-            })
-            self.beta = None  # not used directly
-        else:
-            self.beta = nn.Parameter(torch.randn(n_bases, self.n_covariates, **self._kwargs) * self.std_params)
-            self.betas = None
 
-    def _get_beta(self, group_name=None):
+    def _apply_inverse_link(self, linear_predictor: torch.Tensor) -> torch.Tensor:
+        """Apply the configured inverse-link function."""
+        return self.inverse_link_func(linear_predictor)
+
+    def _group_nll(self, P: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
+        """Compute mean negative log-likelihood for one group."""
+        return _distribution_nll(P, Y, self.marginal_dist, reduction="mean")
+
+    def _sum_group_nll(self, P, Y) -> torch.Tensor:
+        """Compute total NLL for dict or tensor inputs."""
+        if isinstance(Y, dict):
+            return sum(self._group_nll(P[group_name], Y[group_name]) for group_name in Y)
+        return self._group_nll(P, Y)
+
+
+class SpatialBrainLesionModel(_BaseBrainLesionTorchModel):
+    """Spatial brain lesion model with spatial-basis regression coefficients.
+
+    Parameters
+    ----------
+    n_covariates:
+        Number of subject-level covariates.
+    n_auxiliary:
+        Number of auxiliary variables retained for API compatibility.
+    n_bases:
+        Number of spatial basis functions.
+    group_names:
+        Optional group names. If more than one group is supplied, a separate beta
+        matrix is fitted for each group. Otherwise a shared ``beta`` is used.
+    """
+
+    def __init__(
+        self,
+        n_covariates: int,
+        n_auxiliary: int,
+        n_bases: int,
+        n_samples: int = 100,
+        std_params: float = 1.0,
+        std_auxiliary: float = 1.0,
+        link_func: str = "logit",
+        marginal_dist: str = "Bernoulli",
+        regression_terms: Optional[Sequence[str]] = None,
+        group_names: Optional[Sequence[str]] = None,
+        device: str = "cpu",
+        dtype=torch.float32,
+    ):
+        super().__init__(
+            n_covariates=n_covariates,
+            n_auxiliary=n_auxiliary,
+            n_samples=n_samples,
+            std_params=std_params,
+            std_auxiliary=std_auxiliary,
+            link_func=link_func,
+            marginal_dist=marginal_dist,
+            regression_terms=regression_terms,
+            device=device,
+            dtype=dtype,
+        )
+        self.n_bases = n_bases
+        self.group_names = list(group_names) if group_names is not None else None
+        self._initialise_beta_parameters()
+
+    def _initialise_beta_parameters(self) -> None:
+        """Initialise shared or group-specific beta parameters."""
+        if self.group_names is not None and len(self.group_names) > 1:
+            self.betas = nn.ParameterDict(
+                {
+                    group_name: nn.Parameter(
+                        torch.randn(self.n_bases, self.n_covariates, **self._kwargs)
+                        * self.std_params
+                    )
+                    for group_name in self.group_names
+                }
+            )
+            self.beta = None
+            return
+
+        self.beta = nn.Parameter(
+            torch.randn(self.n_bases, self.n_covariates, **self._kwargs) * self.std_params
+        )
+        self.betas = None
+
+    def _get_beta(self, group_name=None) -> torch.Tensor:
         """Return beta for a specific group, or the shared beta."""
         if self.betas is not None and group_name is not None:
             return self.betas[group_name]
         return self.beta
 
+    def _linear_predictor(self, X: torch.Tensor, Z: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
+        """Compute ``Z @ beta.T @ X.T`` for one group."""
+        return Z @ beta.T @ X.T
+
     def forward(self, X, Y, Z):
-        """Compute predicted probabilities for each group.
-
-        Parameters
-        ----------
-        X : dict[str, Tensor] or Tensor  – spatial design matrices
-        Y : dict[str, Tensor] or Tensor  – observed outcomes
-        Z : dict[str, Tensor] or Tensor  – subject covariates
-
-        Returns
-        -------
-        dict[str, Tensor] or Tensor – predicted probabilities per group
-        """
+        """Compute predicted probabilities/means for each group or tensor input."""
         if isinstance(Z, dict):
-            P = {}
-            for group_name in Z:
-                beta_g = self._get_beta(group_name)
-                P[group_name] = self.inverse_link_func(
-                    Z[group_name] @ beta_g.T @ X[group_name].T
+            return {
+                group_name: self._apply_inverse_link(
+                    self._linear_predictor(X[group_name], Z[group_name], self._get_beta(group_name))
                 )
-            return P
-        # Single-group backward compatibility
-        return self.inverse_link_func(Z @ self.beta.T @ X.T)
+                for group_name in Z
+            }
+
+        return self._apply_inverse_link(self._linear_predictor(X, Z, self.beta))
 
     def get_loss(self, P, Y, Z):
-        """Compute total NLL summed across all groups."""
-        if isinstance(Y, dict):
-            total_nll = 0.0
-            for group_name in Y:
-                total_nll += self._group_nll(P[group_name], Y[group_name])
-            return total_nll
-        return self._group_nll(P, Y)
+        """Compute total negative log-likelihood across all groups."""
+        return self._sum_group_nll(P, Y)
 
-    def _group_nll(self, P, Y):
-        """Compute NLL for a single group."""
-        if self.marginal_dist == "Bernoulli":
-            nll = -(torch.log(P) * Y + torch.log(1 - P) * (1 - Y)).mean()
-        elif self.marginal_dist == "Poisson":
-            nll = -(Y * torch.log(P) - P).mean()
-        elif self.marginal_dist == "NB":
-            # For Negative Binomial, we need an additional dispersion parameter. For simplicity, we can set it to 1 here.
-            r = torch.tensor(1.0, dtype=P.dtype, device=P.device)
-            p = r / (r + P)
-            nll = -(torch.lgamma(Y + r) - torch.lgamma(r) - torch.lgamma(Y + 1) + r * torch.log(p) + Y * torch.log(1 - p)).mean()
-        else:
-            raise ValueError(f"Marginal distribution {self.marginal_dist} not supported")
-        return nll
+    @staticmethod
+    def _neg_log_likelihood(
+        marginal_dist,
+        link_func,
+        regression_terms,
+        X_spatial,
+        Y,
+        Z,
+        beta,
+        device="cpu",
+    ):
+        """Static NLL used by autograd-based inference code."""
+        inverse_link_func = _build_inverse_link(link_func)
+        P = inverse_link_func(Z @ beta.T @ X_spatial.T)
+        return _distribution_nll(P, Y, marginal_dist, reduction="sum")
 
-    def _neg_log_likelihood(marginal_dist, link_func, regression_terms, 
-                            X_spatial, Y, Z, beta, device="cpu"):
-        if link_func == "logit":
-            inverse_link_func = nn.Sigmoid()
-        elif link_func == "log":
-            inverse_link_func = torch.exp
-        # Compute probability function
-        P = inverse_link_func(Z @ beta.T @ X_spatial.T) # shape: (n_subject, n_voxel)
-        # negative log-likelihood
-        if marginal_dist == "Bernoulli":
-            nll = -(torch.log(P) * Y + torch.log(1 - P) * (1 - Y)).sum()
-        elif marginal_dist == "Poisson":
-            nll = -(Y * torch.log(P) - P).sum()
-        elif marginal_dist == "NB":
-            r = torch.tensor(1.0, dtype=P.dtype, device=P.device)
-            p_nb = r / (r + P)
-            nll = -(torch.lgamma(Y + r) - torch.lgamma(r) - torch.lgamma(Y + 1) + r * torch.log(p_nb) + Y * torch.log(1 - p_nb)).sum()
-        return nll
 
-class MassUnivariateRegression(nn.Module):
-    def __init__(self,
-                 n_covariates: int,
-                 n_auxiliary: int,
-                 n_voxels: int,
-                 n_samples: int = 100,
-                 std_params: float = .1,
-                 std_auxiliary: float = 1.0,
-                 link_func: str = "logit",
-                 marginal_dist: str = "Bernoulli",
-                 firth_penalty: bool = False,
-                 regression_terms: List[str] = ["multiplicative", "additive"],
-                 device: str = "cpu",
-                 dtype = torch.float32):
-        super().__init__()
-        self.n_covariates = n_covariates
-        self.n_auxiliary = n_auxiliary
+class MassUnivariateRegression(_BaseBrainLesionTorchModel):
+    """Mass-univariate regression model with one coefficient vector per voxel."""
+
+    def __init__(
+        self,
+        n_covariates: int,
+        n_auxiliary: int,
+        n_voxels: int,
+        n_samples: int = 100,
+        std_params: float = 0.1,
+        std_auxiliary: float = 1.0,
+        link_func: str = "logit",
+        marginal_dist: str = "Bernoulli",
+        firth_penalty: bool = False,
+        regression_terms: Optional[Sequence[str]] = None,
+        device: str = "cpu",
+        dtype=torch.float32,
+    ):
+        super().__init__(
+            n_covariates=n_covariates,
+            n_auxiliary=n_auxiliary,
+            n_samples=n_samples,
+            std_params=std_params,
+            std_auxiliary=std_auxiliary,
+            link_func=link_func,
+            marginal_dist=marginal_dist,
+            regression_terms=regression_terms,
+            device=device,
+            dtype=dtype,
+        )
         self.n_voxels = n_voxels
-        self.n_samples = n_samples
-        self.std_params = std_params
-        self.std_auxiliary = std_auxiliary
-        if link_func == "logit":
-            self.inverse_link_func = nn.Sigmoid()
-        elif link_func == "log":
-            self.inverse_link_func = torch.exp
-        elif link_func == "arctanh":
-            self.inverse_link_func = lambda z: (nn.Tanh()(z) + 1.) / 2.
-        else:
-            raise ValueError(f"Link function {link_func} not implemented")
-        self.marginal_dist = marginal_dist
         self.firth_penalty = firth_penalty
-        self.regression_terms = regression_terms
-        self.device = torch.device(device)
-        self.dtype = dtype
-        self._kwargs = {"device": self.device, "dtype": self.dtype}
-        # regression coefficients for covariates
-        self.beta = nn.Parameter(torch.randn(n_voxels, self.n_covariates, **self._kwargs) * self.std_params)
+        self.beta = nn.Parameter(
+            torch.randn(n_voxels, self.n_covariates, **self._kwargs) * self.std_params
+        )
+
+    def _linear_predictor(self, Z: torch.Tensor) -> torch.Tensor:
+        """Compute voxel-wise linear predictors ``Z @ beta.T``."""
+        return Z @ self.beta.T
 
     def forward(self, X, Y, Z):
-        """Compute predicted probabilities for each group.
+        """Compute predicted probabilities/means for dict or tensor inputs.
 
-        Parameters
-        ----------
-        X : dict[str, Tensor] or Tensor  – spatial design matrices (unused but kept for API)
-        Y : dict[str, Tensor] or Tensor  – observed outcomes
-        Z : dict[str, Tensor] or Tensor  – subject covariates
-
-        Returns
-        -------
-        dict[str, Tensor] or Tensor – predicted probabilities per group
+        ``X`` and ``Y`` are retained in the signature for compatibility with the
+        full regression training loop.
         """
-        if isinstance(Z, dict):
-            self.X = X
-            P = {}
-            for group_name in Z:
-                P[group_name] = self.inverse_link_func(
-                    Z[group_name] @ self.beta.T
-                )
-            return P
         self.X = X
+        if isinstance(Z, dict):
+            return {
+                group_name: self._apply_inverse_link(Z[group_name] @ self.beta.T)
+                for group_name in Z
+            }
+
         self.n_subject = Z.shape[0]
-        return self.inverse_link_func(Z @ self.beta.T)
+        return self._apply_inverse_link(self._linear_predictor(Z))
 
     def get_loss(self, P, Y, Z, eps=1e-6):
-        """Compute total NLL summed across all groups, with optional Firth penalty."""
-        if isinstance(Y, dict):
-            total_nll = 0.0
-            for group_name in Y:
-                total_nll += self._group_nll(P[group_name], Y[group_name])
-            if self.firth_penalty:
-                # Firth penalty uses all groups concatenated
-                P_all = torch.cat([P[g] for g in Y], dim=0)
-                Z_all = torch.cat([Z[g] for g in Z], dim=0)
-                total_nll += self._firth_penalty(P_all, Z_all, eps)
-            return total_nll
-        nll = self._group_nll(P, Y)
-        if self.firth_penalty:
-            nll += self._firth_penalty(P, Z, eps)
-        return nll
+        """Compute total NLL, optionally adding the Firth penalty."""
+        nll = self._sum_group_nll(P, Y)
+        if not self.firth_penalty:
+            return nll
 
-    def _group_nll(self, P, Y):
-        """Compute NLL for a single group."""
-        if self.marginal_dist == "Bernoulli":
-            nll = -(torch.log(P) * Y + torch.log(1 - P) * (1 - Y)).mean()
-        elif self.marginal_dist == "Poisson":
-            nll = -(Y * torch.log(P) - P).mean()
-        else:
-            raise ValueError(f"Marginal distribution {self.marginal_dist} not supported")
-        return nll
+        if isinstance(Y, dict):
+            P_all = torch.cat([P[group_name] for group_name in Y], dim=0)
+            Z_all = torch.cat([Z[group_name] for group_name in Y], dim=0)
+            return nll + self._firth_penalty(P_all, Z_all, eps)
+        return nll + self._firth_penalty(P, Z, eps)
 
     def _firth_penalty(self, P, Z, eps=1e-6):
-        """Compute the Firth (half-log-det FI) penalty across all subjects."""
-        # Precompute eye for regularization
-        eye_reg = torch.eye(self.n_covariates, device=self.device) * eps
-        total_penalty = 0.0
+        """Compute the Firth half-log-determinant penalty for all voxels.
 
-        for voxel_idx in range(self.n_voxels):
-            # Get probabilities for this voxel
-            p_voxel = P[:, voxel_idx]  # (n_subjects,)
+        The implementation is batched over voxels and avoids a Python loop over
+        ``n_voxels``. It computes ``0.5 * logdet(Z.T @ W_v @ Z + eps I)`` for
+        each voxel ``v`` and sums the result.
+        """
+        if self.marginal_dist == "Bernoulli":
+            weights = P * (1.0 - P)
+        elif self.marginal_dist == "Poisson":
+            weights = P
+        else:
+            raise ValueError(f"Marginal distribution {self.marginal_dist} not supported")
 
-            # Fisher Information for logistic/Poisson regression at this voxel
-            if self.marginal_dist == "Bernoulli":
-                weights = p_voxel * (1 - p_voxel)
-            elif self.marginal_dist == "Poisson":
-                weights = p_voxel
-            else:
-                raise ValueError(f"Marginal distribution {self.marginal_dist} not supported")
-            sqrt_weights = torch.sqrt(weights)
+        weights = torch.clamp(weights, min=eps)
+        fisher_info = torch.einsum("nr,ns,nv->vrs", Z, Z, weights)
+        eye = torch.eye(self.n_covariates, device=Z.device, dtype=Z.dtype)
+        fisher_info = fisher_info + eps * eye.unsqueeze(0)
+        sign, log_abs_det = torch.linalg.slogdet(fisher_info)
+        if torch.any(sign <= 0):
+            raise RuntimeError("Firth penalty Fisher information is not positive definite")
+        return 0.5 * log_abs_det.sum()
 
-            # Weighted design matrix
-            Z_weighted = Z * sqrt_weights[:, None]  # (n_subjects, n_covariates)
-            # Fisher Information matrix (n_covariates, n_covariates)
-            FI = torch.mm(Z_weighted.t(), Z_weighted)
-            FI += eye_reg
-            # Cholesky
-            L = torch.linalg.cholesky(FI)  # FI = L L^T
-            # logdet(FI) = 2 * sum(log(diag(L)))
-            half_logdet = torch.log(torch.diagonal(L)).sum()
-            total_penalty += half_logdet
-            del L, FI, Z_weighted, p_voxel, sqrt_weights, weights
+    @staticmethod
+    def _neg_log_likelihood(
+        marginal_dist,
+        link_func,
+        regression_terms,
+        X_spatial,
+        Y,
+        Z,
+        beta_param,
+        beta_other,
+        device="cpu",
+    ):
+        """Static NLL used by autograd-based inference code.
 
-        return total_penalty
-
-    def _neg_log_likelihood(marginal_dist, link_func, regression_terms, 
-                            X_spatial, Y, Z, beta_param, beta_other, device="cpu"):
-        # Replace the zero row in beta_other with beta_param using differentiable operations
-        # beta_param has shape (n_voxels,) - the parameter we're differentiating w.r.t.
-        # beta_other has shape (n_covariates, n_voxels) - other parameters set to 0
-        
-        # If beta_param is 1D, reshape it to 2D
+        ``beta_param`` replaces the all-zero row in ``beta_other`` while keeping
+        the operation differentiable for Hessian calculations.
+        """
         if beta_param.dim() == 1:
-            beta_param = beta_param.unsqueeze(0)  # shape: (1, n_voxels)
-        
-        # Find which row is all zeros and create a boolean mask for row-wise replacement
-        zero_row_mask = torch.all(beta_other == 0, dim=1, keepdim=True)  # shape: (n_covariates, 1)
-        
-        # Use torch.where to replace only zero rows with beta_param
-        # Broadcasting: zero_row_mask (n_covariates, 1) broadcasts to (n_covariates, n_voxels)
-        beta = torch.where(zero_row_mask, beta_param, beta_other)  # shape: (n_covariates, n_voxels)
+            beta_param = beta_param.unsqueeze(0)
 
-        if link_func == "logit":
-            inverse_link_func = nn.Sigmoid()
-        elif link_func == "log":
-            inverse_link_func = torch.exp
-        # Compute probability function
-        P = inverse_link_func(Z @ beta) # shape: (n_subject, n_voxel)
-        # negative log-likelihood
-        if marginal_dist == "Bernoulli":
-            nll = -(torch.log(P) * Y + torch.log(1 - P) * (1 - Y)).mean()
-        elif marginal_dist == "Poisson":
-            nll = -(Y * torch.log(P) - P).mean()
-        return nll
+        zero_row_mask = torch.all(beta_other == 0, dim=1, keepdim=True)
+        beta = torch.where(zero_row_mask, beta_param, beta_other)
+        inverse_link_func = _build_inverse_link(link_func)
+        P = inverse_link_func(Z @ beta)
+        return _distribution_nll(P, Y, marginal_dist, reduction="mean")
